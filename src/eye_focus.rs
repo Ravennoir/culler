@@ -1,14 +1,17 @@
 /// Eye-focus helpers: face detection and zoom-offset math.
 ///
+/// Detection is split into two steps so the UI thread only does the cheap part:
+///
+///   1. `prepare_gray`      — downscale the full-res ColorImage to a small
+///                            grayscale buffer (~5 ms, runs on UI thread).
+///   2. `detect_from_gray`  — load the model and run the cascade on that buffer
+///                            (~100–400 ms, must run on a background thread).
+///
 /// # Face model
-/// Detection requires `seeta_fd_frontal_v1.0.bin` in one of these locations
-/// (checked in order):
+/// Requires `seeta_fd_frontal_v1.0.bin` in one of these locations (in order):
 ///   1. `<project_root>/assets/seeta_fd_frontal_v1.0.bin`  (development)
 ///   2. Next to the running executable                      (installed release)
 ///   3. `~/.config/lightningview/seeta_fd_frontal_v1.0.bin` (user config)
-///
-/// If no model is found, `detect_eye_positions` returns an empty `Vec` and logs
-/// a `warn!` message with download instructions.
 use egui::{ColorImage, Pos2, Vec2};
 use std::{
     fs::File,
@@ -24,7 +27,6 @@ pub const EYE_ZOOM: f32 = 4.0;
 // ── model discovery ──────────────────────────────────────────────────────────
 
 fn model_path() -> Option<PathBuf> {
-    // 1. Development: assets/ next to Cargo.toml
     let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("assets")
         .join(MODEL_FILENAME);
@@ -32,7 +34,6 @@ fn model_path() -> Option<PathBuf> {
         return Some(dev);
     }
 
-    // 2. Release: same directory as the running executable
     if let Ok(exe) = std::env::current_exe() {
         let p = exe.parent().unwrap_or(Path::new(".")).join(MODEL_FILENAME);
         if p.exists() {
@@ -40,7 +41,6 @@ fn model_path() -> Option<PathBuf> {
         }
     }
 
-    // 3. User config directory
     #[cfg(target_os = "windows")]
     if let Ok(base) = std::env::var("APPDATA") {
         let p = PathBuf::from(base).join("lightningview").join(MODEL_FILENAME);
@@ -62,14 +62,18 @@ fn model_path() -> Option<PathBuf> {
     None
 }
 
-// ── image conversion ─────────────────────────────────────────────────────────
+// ── step 1: UI thread ─────────────────────────────────────────────────────────
 
-/// Downscale `image` to at most `max_side` on the longest dimension, converting
-/// to 8-bit grayscale.  Returns `(bytes, width, height, scale_factor)`.
-fn to_gray_scaled(image: &ColorImage, max_side: u32) -> (Vec<u8>, u32, u32, f32) {
+/// Downscale `image` to at most 640 px on the longest side, converting to
+/// 8-bit grayscale.  Returns `(gray_bytes, width, height, scale_inv)`.
+///
+/// Iterates only the *output* pixels so it is O(640²) ≈ 273 K ops regardless
+/// of source resolution — safe to call on the UI thread.
+pub fn prepare_gray(image: &ColorImage) -> (Vec<u8>, u32, u32, f32) {
+    const MAX_SIDE: u32 = 640;
     let w = image.width() as u32;
     let h = image.height() as u32;
-    let scale = (max_side as f32 / w.max(h) as f32).min(1.0);
+    let scale = (MAX_SIDE as f32 / w.max(h) as f32).min(1.0);
     let dw = ((w as f32 * scale).round() as u32).max(1);
     let dh = ((h as f32 * scale).round() as u32).max(1);
 
@@ -79,30 +83,29 @@ fn to_gray_scaled(image: &ColorImage, max_side: u32) -> (Vec<u8>, u32, u32, f32)
             let sx = ((x as f32 / scale) as u32).min(w - 1);
             let sy = ((y as f32 / scale) as u32).min(h - 1);
             let [r, g, b, _] = image.pixels[(sy * w + sx) as usize].to_array();
-            // ITU-R BT.601 luminance
             out[(y * dw + x) as usize] =
                 (r as f32 * 0.299 + g as f32 * 0.587 + b as f32 * 0.114) as u8;
         }
     }
-    (out, dw, dh, scale)
+    (out, dw, dh, 1.0 / scale)
 }
 
-// ── public API ────────────────────────────────────────────────────────────────
+// ── step 2: background thread ─────────────────────────────────────────────────
 
-/// Detect eye positions in `image`, returning pixel coordinates in **full-res**
-/// image space.
+/// Run face detection on a pre-scaled grayscale buffer and return estimated
+/// eye positions in **full-resolution** image coordinates.
 ///
-/// Two eye positions (left, right) are estimated for each detected face from its
-/// bounding box.  Returns an empty `Vec` when no faces are found or when the
-/// face-detection model is unavailable.
-pub fn detect_eye_positions(image: &ColorImage) -> Vec<Pos2> {
+/// `scale_inv` is the reciprocal of the scale that was used to produce `gray`
+/// (returned by `prepare_gray`).
+///
+/// This loads the face model from disk on every call — it must run on a
+/// background thread, never on the UI thread.
+pub fn detect_from_gray(gray: Vec<u8>, w: u32, h: u32, scale_inv: f32) -> Vec<Pos2> {
     let Some(path) = model_path() else {
         log::warn!(
-            "Eye detection disabled: {} not found. \
-             Place it in assets/ or run: \
-             mkdir assets && curl -sSL -o assets/{0} \
-             https://github.com/atomashpolskiy/rustface/raw/master/model/{0}",
-            MODEL_FILENAME
+            "Eye detection disabled: {MODEL_FILENAME} not found. \
+             To enable: mkdir assets && curl -sSL -o assets/{MODEL_FILENAME} \
+             https://github.com/atomashpolskiy/rustface/raw/master/model/{MODEL_FILENAME}"
         );
         return vec![];
     };
@@ -123,36 +126,48 @@ pub fn detect_eye_positions(image: &ColorImage) -> Vec<Pos2> {
     };
 
     let mut detector = rustface::create_detector_with_model(model);
-    detector.set_min_face_size(20);
+    // min_face_size relative to a 640 px image: 80 px ≈ face 1/8 of frame width —
+    // appropriate for portraits. Keeps the pyramid to ~3 levels and detection fast.
+    detector.set_min_face_size(80);
     detector.set_score_thresh(2.0);
-    detector.set_pyramid_scale_factor(0.8);
+    detector.set_pyramid_scale_factor(0.85);
     detector.set_slide_window_step(4, 4);
 
-    let (gray, dw, dh, scale) = to_gray_scaled(image, 640);
-    let img_data = rustface::ImageData::new(&gray, dw, dh);
+    let img_data = rustface::ImageData::new(&gray, w, h);
     let faces = detector.detect(&img_data);
 
-    let inv = 1.0 / scale;
     let mut eyes = Vec::with_capacity(faces.len() * 2);
     for face in &faces {
         let b = face.bbox();
-        let fx = b.x() as f32 * inv;
-        let fy = b.y() as f32 * inv;
-        let fw = b.width() as f32 * inv;
-        let fh = b.height() as f32 * inv;
-        // Left eye: ~30 % from left edge, ~37 % from top of bounding box
+        let fx = b.x() as f32 * scale_inv;
+        let fy = b.y() as f32 * scale_inv;
+        let fw = b.width() as f32 * scale_inv;
+        let fh = b.height() as f32 * scale_inv;
+        // Left eye: ~30 % from left, ~37 % from top of bounding box
         eyes.push(Pos2::new(fx + fw * 0.30, fy + fh * 0.37));
-        // Right eye: ~70 % from left edge, ~37 % from top of bounding box
+        // Right eye: ~70 % from left, ~37 % from top of bounding box
         eyes.push(Pos2::new(fx + fw * 0.70, fy + fh * 0.37));
     }
+    log::info!("Eye detection: found {} face(s), {} eye position(s)", faces.len(), eyes.len());
     eyes
 }
+
+// ── convenience wrapper (used by tests) ──────────────────────────────────────
+
+/// Detect eye positions in a `ColorImage` in one call.
+/// Combines `prepare_gray` + `detect_from_gray` — **do not call on the UI thread**.
+pub fn detect_eye_positions(image: &ColorImage) -> Vec<Pos2> {
+    let (gray, w, h, scale_inv) = prepare_gray(image);
+    detect_from_gray(gray, w, h, scale_inv)
+}
+
+// ── zoom math ─────────────────────────────────────────────────────────────────
 
 /// Return the `offset` that centres `eye_pos` on a viewport of `view_size`
 /// at the given `zoom` level.
 ///
 /// The image is drawn at `available_rect.min + offset`; each image pixel
-/// occupies `zoom` screen pixels.  This is a pure function with no side effects.
+/// occupies `zoom` screen pixels.  Pure function, no side effects.
 pub fn eye_zoom_offset(eye_pos: Pos2, zoom: f32, view_size: Vec2) -> Vec2 {
     view_size / 2.0 - eye_pos.to_vec2() * zoom
 }

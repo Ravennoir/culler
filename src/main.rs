@@ -116,6 +116,11 @@ struct ImageViewerApp {
     eye_index: usize,
     /// The `current_index` for which `eye_positions` was computed.
     eye_positions_for: Option<usize>,
+    /// Receives `(order_pos, eye_positions)` from the background detection thread.
+    eye_rx: mpsc::Receiver<(usize, Vec<egui::Pos2>)>,
+    eye_tx: mpsc::Sender<(usize, Vec<egui::Pos2>)>,
+    /// True while a detection thread is running — prevents double-spawning.
+    eye_detection_pending: bool,
     /// View size from the previous frame, used when 'E' is handled before layout.
     last_view_size: Vec2,
     show_help_overlay: bool,
@@ -136,6 +141,8 @@ impl ImageViewerApp {
         // rayon threads block. Each embedded JPEG ColorImage ≈ 10 MB → ≤ 80 MB
         // of channel backlog at any time, regardless of folder size.
         let (background_tx, background_rx) = mpsc::sync_channel(8);
+        // Eye detection results arrive here from the background thread.
+        let (eye_tx, eye_rx) = mpsc::channel::<(usize, Vec<egui::Pos2>)>();
         let mut app = Self {
             compare_images: HashMap::new(),
             compare_set: Vec::new(),
@@ -169,6 +176,9 @@ impl ImageViewerApp {
             eye_positions: Vec::new(),
             eye_index: 0,
             eye_positions_for: None,
+            eye_rx,
+            eye_tx,
+            eye_detection_pending: false,
             last_view_size: Vec2::new(1920.0, 1080.0),
             compare_zoom: 1.0,
             compare_offsets: HashMap::new(),
@@ -1048,30 +1058,45 @@ impl ImageViewerApp {
 
     /// Called when the user presses 'E'.
     ///
-    /// First press on a new image: detects faces synchronously on a downscaled copy
-    /// and zooms to the first eye.  Subsequent presses cycle through the remaining
-    /// detected eyes ("reroll") so the user can pick a better result.
+    /// First press on a new image: downscales to grayscale on the UI thread
+    /// (~5 ms) then hands detection off to a background thread (~100–400 ms).
+    /// The zoom is applied once the result arrives via `poll_eye_detection`.
+    ///
+    /// Subsequent presses (same image, result already cached) cycle through
+    /// the detected eyes immediately ("reroll").
     fn cycle_eye_focus(&mut self) {
         let idx = self.current_index;
 
-        // Detect (or re-use cache) for this image.
-        if self.eye_positions_for != Some(idx) {
-            let positions = self.compare_images.get(&idx)
-                .map(|img| eye_focus::detect_eye_positions(&img.full_res_image))
-                .unwrap_or_default();
-            self.eye_positions = positions;
-            self.eye_positions_for = Some(idx);
-            self.eye_index = 0;
-        } else if !self.eye_positions.is_empty() {
-            // Reroll: advance to the next eye, wrapping around.
-            self.eye_index = (self.eye_index + 1) % self.eye_positions.len();
+        // Cached result for this image → just cycle.
+        if self.eye_positions_for == Some(idx) {
+            if !self.eye_positions.is_empty() {
+                self.eye_index = (self.eye_index + 1) % self.eye_positions.len();
+                self.apply_eye_zoom();
+            }
+            return;
         }
 
-        let Some(&eye_pos) = self.eye_positions.get(self.eye_index) else {
-            log::info!("Eye focus: no faces detected in this image.");
+        // Detection already running for this image → ignore the keypress.
+        if self.eye_detection_pending {
             return;
-        };
+        }
 
+        // Prepare the grayscale buffer on the UI thread (fast: iterates output pixels only).
+        let Some(img) = self.compare_images.get(&idx) else { return };
+        let (gray, w, h, scale_inv) = eye_focus::prepare_gray(&img.full_res_image);
+
+        // Spawn a background thread for the slow parts: model load + cascade detection.
+        let tx = self.eye_tx.clone();
+        std::thread::spawn(move || {
+            let positions = eye_focus::detect_from_gray(gray, w, h, scale_inv);
+            let _ = tx.send((idx, positions));
+        });
+        self.eye_detection_pending = true;
+    }
+
+    /// Apply the current eye zoom using `self.eye_positions[self.eye_index]`.
+    fn apply_eye_zoom(&mut self) {
+        let Some(&eye_pos) = self.eye_positions.get(self.eye_index) else { return };
         self.zoom = eye_focus::EYE_ZOOM;
         self.offset = eye_focus::eye_zoom_offset(eye_pos, eye_focus::EYE_ZOOM, self.last_view_size);
         self.is_scaled_to_fit = false;
@@ -1083,6 +1108,22 @@ impl ImageViewerApp {
             eye_pos.x,
             eye_pos.y,
         );
+    }
+
+    /// Drain the eye detection channel. Called every frame from `logic()`.
+    fn poll_eye_detection(&mut self, ctx: &egui::Context) {
+        while let Ok((idx, positions)) = self.eye_rx.try_recv() {
+            self.eye_detection_pending = false;
+            // Discard stale results for images the user has already navigated away from.
+            if idx != self.current_index {
+                continue;
+            }
+            self.eye_positions = positions;
+            self.eye_positions_for = Some(idx);
+            self.eye_index = 0;
+            self.apply_eye_zoom();
+            ctx.request_repaint();
+        }
     }
 
     fn handle_keyboard_input(&mut self, ctx: &egui::Context) {
@@ -1309,6 +1350,7 @@ impl eframe::App for ImageViewerApp {
     /// `request_repaint` fired (eframe 0.34 API).  Non-UI background work goes here.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_prefetch(ctx);
+        self.poll_eye_detection(ctx);
     }
 
 fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
