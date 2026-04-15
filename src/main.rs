@@ -1124,6 +1124,11 @@ impl ImageViewerApp {
             self.apply_eye_zoom();
             ctx.request_repaint();
         }
+        // Keep the event loop ticking while detection is in flight so the result
+        // is applied as soon as it arrives — same pattern as poll_prefetch.
+        if self.eye_detection_pending {
+            ctx.request_repaint();
+        }
     }
 
     fn handle_keyboard_input(&mut self, ctx: &egui::Context) {
