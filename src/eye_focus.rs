@@ -126,11 +126,12 @@ pub fn detect_from_gray(gray: Vec<u8>, w: u32, h: u32, scale_inv: f32) -> Vec<Po
     };
 
     let mut detector = rustface::create_detector_with_model(model);
-    // min_face_size relative to a 640 px image: 80 px ≈ face 1/8 of frame width —
-    // appropriate for portraits. Keeps the pyramid to ~3 levels and detection fast.
-    detector.set_min_face_size(80);
+    // min_face_size of 40 on a 640 px image ≈ face 6 % of frame width — catches
+    // subjects from close-up portraits to full-body shots. Detection runs on a
+    // background thread so pyramid depth (~6 levels) is not a concern.
+    detector.set_min_face_size(40);
     detector.set_score_thresh(2.0);
-    detector.set_pyramid_scale_factor(0.85);
+    detector.set_pyramid_scale_factor(0.8);
     detector.set_slide_window_step(4, 4);
 
     let img_data = rustface::ImageData::new(&gray, w, h);

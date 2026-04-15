@@ -1073,6 +1073,7 @@ impl ImageViewerApp {
                 self.eye_index = (self.eye_index + 1) % self.eye_positions.len();
                 self.apply_eye_zoom();
             }
+            // Empty cache means detection ran but found nothing — nothing to do.
             return;
         }
 
@@ -1081,8 +1082,11 @@ impl ImageViewerApp {
             return;
         }
 
-        // Prepare the grayscale buffer on the UI thread (fast: iterates output pixels only).
+        // Don't run detection on thumbnails — the full image may still be loading.
+        // The thumbnail is typically 160×120 px, far too small for face detection.
         let Some(img) = self.compare_images.get(&idx) else { return };
+        if img.is_thumbnail { return; }
+
         let (gray, w, h, scale_inv) = eye_focus::prepare_gray(&img.full_res_image);
 
         // Spawn a background thread for the slow parts: model load + cascade detection.
@@ -1118,10 +1122,16 @@ impl ImageViewerApp {
             if idx != self.current_index {
                 continue;
             }
-            self.eye_positions = positions;
-            self.eye_positions_for = Some(idx);
-            self.eye_index = 0;
-            self.apply_eye_zoom();
+            if positions.is_empty() {
+                // No faces found — don't cache so the user can retry with E
+                // (e.g. after navigating back, or with a better framing).
+                log::info!("Eye focus: no faces detected.");
+            } else {
+                self.eye_positions = positions;
+                self.eye_positions_for = Some(idx);
+                self.eye_index = 0;
+                self.apply_eye_zoom();
+            }
             ctx.request_repaint();
         }
         // Keep the event loop ticking while detection is in flight so the result
