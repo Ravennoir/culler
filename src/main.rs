@@ -1066,33 +1066,40 @@ impl ImageViewerApp {
     /// the detected eyes immediately ("reroll").
     fn cycle_eye_focus(&mut self) {
         let idx = self.current_index;
+        log::info!("cycle_eye_focus: idx={} for={:?} pending={}", idx, self.eye_positions_for, self.eye_detection_pending);
 
         // Cached result for this image → just cycle.
         if self.eye_positions_for == Some(idx) {
+            log::info!("cycle_eye_focus: cached {} eye(s), cycling", self.eye_positions.len());
             if !self.eye_positions.is_empty() {
                 self.eye_index = (self.eye_index + 1) % self.eye_positions.len();
                 self.apply_eye_zoom();
             }
-            // Empty cache means detection ran but found nothing — nothing to do.
             return;
         }
 
         // Detection already running for this image → ignore the keypress.
         if self.eye_detection_pending {
+            log::info!("cycle_eye_focus: detection already pending, ignoring");
             return;
         }
 
-        // Don't run detection on thumbnails — the full image may still be loading.
-        // The thumbnail is typically 160×120 px, far too small for face detection.
-        let Some(img) = self.compare_images.get(&idx) else { return };
-        if img.is_thumbnail { return; }
+        let Some(img) = self.compare_images.get(&idx) else {
+            log::info!("cycle_eye_focus: image not in cache, cannot detect");
+            return;
+        };
+        if img.is_thumbnail {
+            log::info!("cycle_eye_focus: image is still a thumbnail, skipping");
+            return;
+        }
 
+        log::info!("cycle_eye_focus: spawning detection thread for idx={} image={}x{}", idx, img.full_res_image.width(), img.full_res_image.height());
         let (gray, w, h, scale_inv) = eye_focus::prepare_gray(&img.full_res_image);
 
-        // Spawn a background thread for the slow parts: model load + cascade detection.
         let tx = self.eye_tx.clone();
         std::thread::spawn(move || {
             let positions = eye_focus::detect_from_gray(gray, w, h, scale_inv);
+            log::info!("detection thread: found {} position(s) for idx={}", positions.len(), idx);
             let _ = tx.send((idx, positions));
         });
         self.eye_detection_pending = true;
@@ -1231,6 +1238,7 @@ impl ImageViewerApp {
         }
         // E: zoom to detected eye / cycle to next eye (reroll)
         if ctx.input(|i| i.key_pressed(egui::Key::E)) && !shift && !alt {
+            log::info!("E key pressed");
             self.cycle_eye_focus();
         }
         // Invalidate EXIF cache whenever the displayed image changes
