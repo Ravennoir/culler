@@ -121,6 +121,8 @@ struct ImageViewerApp {
     eye_tx: mpsc::Sender<(usize, Vec<egui::Pos2>)>,
     /// True while a detection thread is running — prevents double-spawning.
     eye_detection_pending: bool,
+    /// True when the last detection finished with no faces found.
+    eye_no_face: bool,
     /// View size from the previous frame, used when 'E' is handled before layout.
     last_view_size: Vec2,
     show_help_overlay: bool,
@@ -179,6 +181,7 @@ impl ImageViewerApp {
             eye_rx,
             eye_tx,
             eye_detection_pending: false,
+            eye_no_face: false,
             last_view_size: Vec2::new(1920.0, 1080.0),
             compare_zoom: 1.0,
             compare_offsets: HashMap::new(),
@@ -1094,6 +1097,7 @@ impl ImageViewerApp {
         }
 
         log::info!("cycle_eye_focus: spawning detection thread for idx={} image={}x{}", idx, img.full_res_image.width(), img.full_res_image.height());
+        self.eye_no_face = false;
         let (gray, w, h, scale_inv) = eye_focus::prepare_gray(&img.full_res_image);
 
         let tx = self.eye_tx.clone();
@@ -1130,10 +1134,10 @@ impl ImageViewerApp {
                 continue;
             }
             if positions.is_empty() {
-                // No faces found — don't cache so the user can retry with E
-                // (e.g. after navigating back, or with a better framing).
                 log::info!("Eye focus: no faces detected.");
+                self.eye_no_face = true;
             } else {
+                self.eye_no_face = false;
                 self.eye_positions = positions;
                 self.eye_positions_for = Some(idx);
                 self.eye_index = 0;
@@ -1723,6 +1727,24 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                 let badge_rect = Rect::from_min_size(badge_pos, Vec2::new(34.0, 18.0));
                 ui.painter().rect_filled(badge_rect, 3.0, Color32::from_rgb(255, 180, 0));
                 ui.painter().text(badge_rect.center(), egui::Align2::CENTER_CENTER, "REF",
+                    egui::FontId::proportional(11.0), Color32::BLACK);
+            }
+
+            // Eye-detection status badge — top-right corner
+            let eye_badge: Option<(&str, Color32)> = if self.eye_detection_pending {
+                Some(("EYE...", Color32::from_rgb(100, 180, 255)))
+            } else if self.eye_no_face {
+                Some(("NO FACE", Color32::from_rgb(220, 80, 80)))
+            } else {
+                None
+            };
+            if let Some((label, color)) = eye_badge {
+                let hud_offset = if self.is_culling_mode { 34.0 } else { 0.0 };
+                let badge_w = 56.0;
+                let badge_pos = Pos2::new(available_rect.max.x - badge_w - 8.0, available_rect.min.y + hud_offset + 6.0);
+                let badge_rect = Rect::from_min_size(badge_pos, Vec2::new(badge_w, 18.0));
+                ui.painter().rect_filled(badge_rect, 3.0, color);
+                ui.painter().text(badge_rect.center(), egui::Align2::CENTER_CENTER, label,
                     egui::FontId::proportional(11.0), Color32::BLACK);
             }
 
