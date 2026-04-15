@@ -1167,6 +1167,12 @@ impl ImageViewerApp {
                         self.load_exif_for_current();
                     }
                 }
+                // 'e' — eye focus. Caught via Text event (same as '?') as a
+                // robust fallback in case key_pressed misses it.
+                egui::Event::Text(t) if t == "e" || t == "E" => {
+                    log::info!("E via Text event");
+                    self.cycle_eye_focus();
+                }
                 _ => {}
             }
         }
@@ -2268,6 +2274,7 @@ fn downscale_color_image(image: ColorImage, max_size: usize) -> ColorImage {
 // --- Main Entry Point ---
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
+    log::info!("LightningView {} starting", env!("CARGO_PKG_VERSION"));
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         println!("Usage: {} [/windowed] <imagefile>", args[0]);
