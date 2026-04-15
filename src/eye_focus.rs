@@ -18,6 +18,7 @@ use std::{
     io::BufReader,
     path::{Path, PathBuf},
 };
+use image::GenericImageView;
 
 const MODEL_FILENAME: &str = "seeta_fd_frontal_v1.0.bin";
 
@@ -88,6 +89,33 @@ pub fn prepare_gray(image: &ColorImage) -> (Vec<u8>, u32, u32, f32) {
         }
     }
     (out, dw, dh, 1.0 / scale)
+}
+
+/// Decode a JPEG byte slice and produce a grayscale buffer ready for detection.
+/// Equivalent to decoding the JPEG and calling `prepare_gray`, but avoids
+/// allocating an intermediate `ColorImage`.  Returns `None` if the JPEG is
+/// unreadable.
+pub fn prepare_gray_from_jpeg(jpeg_bytes: &[u8]) -> Option<(Vec<u8>, u32, u32, f32)> {
+    let img = image::load_from_memory_with_format(jpeg_bytes, image::ImageFormat::Jpeg).ok()?;
+    let (iw, ih) = img.dimensions();
+    let rgb = img.to_rgb8();
+
+    const MAX_SIDE: u32 = 640;
+    let scale = (MAX_SIDE as f32 / iw.max(ih) as f32).min(1.0);
+    let dw = ((iw as f32 * scale).round() as u32).max(1);
+    let dh = ((ih as f32 * scale).round() as u32).max(1);
+
+    let mut out = vec![0u8; (dw * dh) as usize];
+    for y in 0..dh {
+        for x in 0..dw {
+            let sx = ((x as f32 / scale) as u32).min(iw - 1);
+            let sy = ((y as f32 / scale) as u32).min(ih - 1);
+            let [r, g, b] = rgb.get_pixel(sx, sy).0;
+            out[(y * dw + x) as usize] =
+                (r as f32 * 0.299 + g as f32 * 0.587 + b as f32 * 0.114) as u8;
+        }
+    }
+    Some((out, dw, dh, 1.0 / scale))
 }
 
 // ── step 2: background thread ─────────────────────────────────────────────────

@@ -1096,9 +1096,31 @@ impl ImageViewerApp {
             return;
         }
 
-        log::info!("cycle_eye_focus: spawning detection thread for idx={} image={}x{}", idx, img.full_res_image.width(), img.full_res_image.height());
+        // For RAW files extract the embedded JPEG directly (capped at 2 MP) so
+        // detection never runs on a full 24 MP decode.  Fall back to full_res_image
+        // for non-RAW formats or when no embedded JPEG is found.
+        let path = self.image_files.get(self.image_order[idx]).cloned();
+        let ext = path.as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+
+        let jpeg_gray = if RAW_SUPPORTED_FORMATS.contains(&ext.as_str()) {
+            path.as_ref()
+                .and_then(|p| raw_preview::extract_preview_jpeg_capped(p, 2_000_000))
+                .and_then(|jpeg| eye_focus::prepare_gray_from_jpeg(&jpeg))
+        } else {
+            None
+        };
+        let (gray, w, h, scale_inv) = jpeg_gray
+            .unwrap_or_else(|| eye_focus::prepare_gray(&img.full_res_image));
+
+        log::info!(
+            "cycle_eye_focus: spawning detection thread for idx={} gray={}x{} source={}",
+            idx, w, h, if RAW_SUPPORTED_FORMATS.contains(&ext.as_str()) { "embedded-jpeg" } else { "full_res_image" }
+        );
         self.eye_no_face = false;
-        let (gray, w, h, scale_inv) = eye_focus::prepare_gray(&img.full_res_image);
 
         let tx = self.eye_tx.clone();
         std::thread::spawn(move || {
