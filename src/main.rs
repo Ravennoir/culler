@@ -16,11 +16,13 @@ use std::{
     env,
     error::Error,
     fs,
-    io::{BufReader, Cursor},
+    io::{BufRead, BufReader, Cursor, Write},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
     borrow::Cow,
 };
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
 
 use lightningview::{eye_focus, raw_preview};
 
@@ -82,10 +84,10 @@ struct ImageViewerApp {
     // priority_tx  : unbounded; at most ~13 items in flight (next/prev 10 + compare set).
     // background_tx: bounded sync_channel; rayon threads block when full, capping
     //                the number of decoded ColorImages queued in memory at any time.
-    priority_tx:   mpsc::Sender<(usize, ColorImage)>,
-    priority_rx:   mpsc::Receiver<(usize, ColorImage)>,
-    background_tx: mpsc::SyncSender<(usize, ColorImage)>,
-    background_rx: mpsc::Receiver<(usize, ColorImage)>,
+    priority_tx:   mpsc::Sender<(usize, ColorImage, u64)>,
+    priority_rx:   mpsc::Receiver<(usize, ColorImage, u64)>,
+    background_tx: mpsc::SyncSender<(usize, ColorImage, u64)>,
+    background_rx: mpsc::Receiver<(usize, ColorImage, u64)>,
     prefetch_pending: HashSet<usize>,
 
     // Culling mode
@@ -133,6 +135,14 @@ struct ImageViewerApp {
     /// Loaded on demand; cleared when the current image changes.
     exif_data: Vec<(String, String, String)>,
     exif_for_index: Option<usize>,
+
+    // ── CLI control socket ────────────────────────────────────────────────────
+    /// Unix domain socket for in-process CLI commands (macOS/Linux).
+    /// Polled non-blocking every frame; safe to ignore if binding fails.
+    #[cfg(unix)]
+    cmd_listener: Option<UnixListener>,
+    /// Ring buffer of recent decode times: (order_pos, path_stem, decode_ms).
+    load_times: std::collections::VecDeque<(usize, String, u64)>,
 }
 
 impl ImageViewerApp {
@@ -188,6 +198,16 @@ impl ImageViewerApp {
             compare_offsets: HashMap::new(),
             exif_data: Vec::new(),
             exif_for_index: None,
+            #[cfg(unix)]
+            cmd_listener: {
+                let path = "/tmp/lightningview.sock";
+                let _ = fs::remove_file(path);
+                UnixListener::bind(path).ok().and_then(|l| {
+                    l.set_nonblocking(true).ok()?;
+                    Some(l)
+                })
+            },
+            load_times: std::collections::VecDeque::with_capacity(64),
         };
         if let Some(path) = path {
             // scan_image_directory uses DirEntry::file_type() — no extra stat() per
@@ -558,36 +578,27 @@ impl ImageViewerApp {
             let Some(path) = self.image_files.get(file_idx).cloned() else { continue };
             self.prefetch_pending.insert(pos);
             if priority {
-                // Dedicated OS thread — starts immediately, sends to the unbounded
-                // priority channel so it never blocks waiting for the main thread.
                 let tx = self.priority_tx.clone();
                 std::thread::spawn(move || {
-                    log::debug!("thread[{}]: starting load", pos);
+                    let t = Instant::now();
                     match load_image(&path) {
                         Ok(LoadedImage::Static(img)) => {
-                            log::debug!("thread[{}]: decoded {}×{}, sending", pos, img.width(), img.height());
-                            match tx.send((pos, img)) {
-                                Ok(()) => log::debug!("thread[{}]: sent OK", pos),
-                                Err(_) => log::warn!("thread[{}]: send FAILED — receiver dropped", pos),
-                            }
+                            let ms = t.elapsed().as_millis() as u64;
+                            log::debug!("thread[{}]: decoded {}×{} in {}ms", pos, img.width(), img.height(), ms);
+                            let _ = tx.send((pos, img, ms));
                         }
                         Err(e) => log::warn!("thread[{}]: load FAILED: {}", pos, e),
                     }
                 });
             } else {
-                // Rayon global pool — bounded by num_cpus threads. Sends to the
-                // bounded sync_channel: when the channel is full (8 items) the
-                // rayon thread blocks, preventing unbounded memory accumulation.
                 let tx = self.background_tx.clone();
                 rayon::spawn(move || {
-                    log::debug!("bg_thread[{}]: starting load", pos);
+                    let t = Instant::now();
                     match load_image(&path) {
                         Ok(LoadedImage::Static(img)) => {
-                            log::debug!("bg_thread[{}]: decoded {}×{}, sending", pos, img.width(), img.height());
-                            match tx.send((pos, img)) {
-                                Ok(()) => log::debug!("bg_thread[{}]: sent OK", pos),
-                                Err(_) => log::warn!("bg_thread[{}]: send FAILED — receiver dropped", pos),
-                            }
+                            let ms = t.elapsed().as_millis() as u64;
+                            log::debug!("bg_thread[{}]: decoded {}×{} in {}ms", pos, img.width(), img.height(), ms);
+                            let _ = tx.send((pos, img, ms));
                         }
                         Err(e) => log::warn!("bg_thread[{}]: load FAILED: {}", pos, e),
                     }
@@ -606,9 +617,10 @@ impl ImageViewerApp {
 
         // ── Priority channel: drain everything ──────────────────────────────
         let mut priority_drained = 0u32;
-        while let Ok((pos, color_image)) = self.priority_rx.try_recv() {
+        while let Ok((pos, color_image, decode_ms)) = self.priority_rx.try_recv() {
             priority_drained += 1;
             self.prefetch_pending.remove(&pos);
+            self.record_load_time(pos, decode_ms);
             if self.compare_images.get(&pos).map(|d| !d.is_thumbnail).unwrap_or(false) { continue; }
             any_new |= self.insert_decoded_image(pos, color_image, ctx);
         }
@@ -617,9 +629,10 @@ impl ImageViewerApp {
         let mut bg_processed = 0u32;
         while bg_processed < 4 {
             match self.background_rx.try_recv() {
-                Ok((pos, color_image)) => {
+                Ok((pos, color_image, decode_ms)) => {
                     bg_processed += 1;
                     self.prefetch_pending.remove(&pos);
+                    self.record_load_time(pos, decode_ms);
                     if self.compare_images.get(&pos).map(|d| !d.is_thumbnail).unwrap_or(false) { continue; }
                     self.insert_decoded_image(pos, color_image, ctx);
                 }
@@ -687,18 +700,9 @@ impl ImageViewerApp {
             bytes as f64 / 1_048_576.0,
             self.compare_images.len(),
         );
-        // Queue for background eye detection if not already cached or in-flight.
-        // Current image goes to the front so it is detected before neighbours.
-        if !self.eye_results.contains_key(&pos)
-            && self.eye_detecting_for != Some(pos)
-            && !self.eye_detect_queue.contains(&pos)
-        {
-            if pos == self.current_index {
-                self.eye_detect_queue.push_front(pos);
-            } else {
-                self.eye_detect_queue.push_back(pos);
-            }
-        }
+        // Eye detection is on-demand only (user presses E).
+        // Do NOT auto-queue here — detection is expensive and would compete with
+        // the prefetch burst that fires immediately after the first image loads.
 
         if pos == self.current_index {
             self.is_scaled_to_fit = true;
@@ -1039,6 +1043,133 @@ impl ImageViewerApp {
         let _ = fs::write(&path, contents);
     }
 
+    fn gather_images_from_directory(&mut self, file_path: &Path) {
+        let files = scan_image_directory(file_path);
+        self.current_index = files.iter().position(|p| p == file_path).unwrap_or(0);
+        self.image_files  = files;
+        self.image_order  = (0..self.image_files.len()).collect();
+    }
+
+    fn record_load_time(&mut self, pos: usize, decode_ms: u64) {
+        let stem = self.image_order.get(pos)
+            .and_then(|&fi| self.image_files.get(fi))
+            .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if self.load_times.len() == 64 { self.load_times.pop_front(); }
+        self.load_times.push_back((pos, stem, decode_ms));
+    }
+
+    // ── CLI command socket ────────────────────────────────────────────────────
+
+    /// Poll the Unix domain socket for incoming CLI commands (non-blocking).
+    /// Each connection gets one command line in, one response line out.
+    #[cfg(unix)]
+    fn poll_commands(&mut self, ctx: &egui::Context) {
+        use std::io::ErrorKind;
+        use std::os::unix::net::UnixStream;
+
+        // Phase 1 — accept connections and read command strings while holding
+        // the (immutable) listener borrow.
+        let mut pending: Vec<(String, UnixStream)> = Vec::new();
+        if let Some(ref listener) = self.cmd_listener {
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_read_timeout(Some(Duration::from_millis(50))).ok();
+                        let mut line = String::new();
+                        if BufReader::new(&stream).read_line(&mut line).is_ok() {
+                            pending.push((line, stream));
+                        }
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // Phase 2 — process commands (mutable self borrow, listener not held).
+        for (line, mut stream) in pending {
+            let response = self.handle_command(line.trim(), ctx);
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(b"\n");
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn poll_commands(&mut self, _ctx: &egui::Context) {}
+
+    /// Execute one CLI command and return the response string.
+    fn handle_command(&mut self, cmd: &str, ctx: &egui::Context) -> String {
+        let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
+        match parts[0] {
+            "status" => {
+                let mem_mb: f64 = self.compare_images.values()
+                    .map(|d| (d.full_res_image.width() * d.full_res_image.height() * 4) as f64 / 1_048_576.0)
+                    .sum();
+                let cur_path = self.image_order.get(self.current_index)
+                    .and_then(|&fi| self.image_files.get(fi))
+                    .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                format!(
+                    "cur={} ({}) cache={} pending={} mem={:.1}MB total_files={} eye_queue={} eye_active={}",
+                    self.current_index, cur_path,
+                    self.compare_images.len(), self.prefetch_pending.len(),
+                    mem_mb, self.image_files.len(),
+                    self.eye_detect_queue.len(),
+                    self.eye_detecting_for.map(|i| i.to_string()).unwrap_or("-".into()),
+                )
+            }
+            "perf" => {
+                if self.load_times.is_empty() {
+                    return "no load times recorded yet".into();
+                }
+                let lines: Vec<String> = self.load_times.iter()
+                    .map(|(pos, stem, ms)| format!("  pos={:4} {:40} {}ms", pos, stem, ms))
+                    .collect();
+                format!("recent decode times ({}):\n{}", lines.len(), lines.join("\n"))
+            }
+            "cache" => {
+                let mut entries: Vec<(usize, String)> = self.compare_images.iter()
+                    .map(|(&pos, img)| {
+                        let path = self.image_order.get(pos)
+                            .and_then(|&fi| self.image_files.get(fi))
+                            .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let label = format!("pos={:4} {:40} {}x{} thumb={}",
+                            pos, path,
+                            img.full_res_image.width(), img.full_res_image.height(),
+                            img.is_thumbnail);
+                        (pos, label)
+                    })
+                    .collect();
+                entries.sort_by_key(|(pos, _)| *pos);
+                format!("cache ({}):\n{}", entries.len(),
+                    entries.iter().map(|(_, s)| format!("  {}", s)).collect::<Vec<_>>().join("\n"))
+            }
+            "next" => { self.next_image(ctx); ctx.request_repaint(); "ok".into() }
+            "prev" => { self.prev_image(ctx); ctx.request_repaint(); "ok".into() }
+            "open" if parts.len() == 2 => {
+                let path = PathBuf::from(parts[1]);
+                if path.exists() {
+                    self.gather_images_from_directory(&path);
+                    let cur = self.current_index;
+                    self.compare_set = vec![cur];
+                    self.compare_focus = 0;
+                    self.load_thumbnail_sync(cur, ctx);
+                    self.prefetch_images(&[cur]);
+                    ctx.request_repaint();
+                    "ok".into()
+                } else {
+                    format!("file not found: {}", parts[1])
+                }
+            }
+            "help" | "" => {
+                "commands: status | perf | cache | next | prev | open <path>".into()
+            }
+            other => format!("unknown: {} (try 'help')", other),
+        }
+    }
+
     /// Called when the user presses 'E'.
     ///
     /// If a result is already cached for this image: cycle through the detected
@@ -1113,14 +1244,12 @@ impl ImageViewerApp {
             }
         }
 
-        // Start the next detection when the slot is free.
-        // The current image is started immediately — the user may be waiting for it.
-        // All other images respect the idle gate (prefetch_pending < 20) to avoid
-        // competing with the initial burst of image-loading disk I/O.
+        // Start the next detection when the slot is free and the system is idle.
+        // Detection only reaches the queue via an explicit E keypress, so we never
+        // need to rush it — always respect the idle gate.
         if self.eye_detecting_for.is_none() && !self.eye_detect_queue.is_empty() {
-            let next_is_current = self.eye_detect_queue.front() == Some(&self.current_index);
-            let idle = self.prefetch_pending.len() < 20;
-            if next_is_current || idle {
+            let idle = self.prefetch_pending.len() < 4;
+            if idle {
                 self.run_next_detection();
             }
         }
@@ -1358,6 +1487,7 @@ impl eframe::App for ImageViewerApp {
     /// Called before every `ui` call, and also when the window is hidden but
     /// `request_repaint` fired (eframe 0.34 API).  Non-UI background work goes here.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_commands(ctx);
         self.poll_prefetch(ctx);
         self.poll_eye_detection(ctx);
     }
@@ -2343,10 +2473,27 @@ fn downscale_color_image(image: ColorImage, max_size: usize) -> ColorImage {
 // --- Main Entry Point ---
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
-    log::info!("LightningView {} starting", env!("CARGO_PKG_VERSION"));
     let args: Vec<String> = env::args().collect();
+
+    // ── CLI client mode: send a command to the running instance ──────────────
+    #[cfg(unix)]
+    if args.get(1).map(|s| s.as_str()) == Some("--cmd") {
+        use std::os::unix::net::UnixStream;
+        let cmd = args.get(2).map(|s| s.as_str()).unwrap_or("help");
+        let mut stream = UnixStream::connect("/tmp/lightningview.sock")
+            .map_err(|e| format!("Cannot connect to running LightningView instance: {e}\n(is LightningView running?)"))?;
+        writeln!(stream, "{}", cmd)?;
+        stream.shutdown(std::net::Shutdown::Write)?;
+        let mut response = String::new();
+        std::io::Read::read_to_string(&mut stream, &mut response)?;
+        print!("{}", response);
+        return Ok(());
+    }
+
+    log::info!("LightningView {} starting", env!("CARGO_PKG_VERSION"));
     if args.len() < 2 {
         println!("Usage: {} [/windowed] <imagefile>", args[0]);
+        println!("       {} --cmd <command>   (send command to running instance)", args[0]);
         return Ok(());
     }
     
