@@ -143,6 +143,9 @@ struct ImageViewerApp {
     cmd_listener: Option<UnixListener>,
     /// Ring buffer of recent decode times: (order_pos, path_stem, decode_ms).
     load_times: std::collections::VecDeque<(usize, String, u64)>,
+    /// Set by the `eye` socket command to start detection immediately,
+    /// bypassing the idle gate (user explicitly requested it).
+    eye_force: bool,
 }
 
 impl ImageViewerApp {
@@ -208,6 +211,7 @@ impl ImageViewerApp {
                 })
             },
             load_times: std::collections::VecDeque::with_capacity(64),
+            eye_force: false,
         };
         if let Some(path) = path {
             // scan_image_directory uses DirEntry::file_type() — no extra stat() per
@@ -1106,13 +1110,18 @@ impl ImageViewerApp {
                 let mem_mb: f64 = self.compare_images.values()
                     .map(|d| (d.full_res_image.width() * d.full_res_image.height() * 4) as f64 / 1_048_576.0)
                     .sum();
+                let loaded = self.compare_images.values().filter(|d| !d.is_thumbnail).count();
                 let cur_path = self.image_order.get(self.current_index)
                     .and_then(|&fi| self.image_files.get(fi))
                     .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
                     .unwrap_or_default();
+                let cur_loaded = self.compare_images.get(&self.current_index)
+                    .map(|d| !d.is_thumbnail)
+                    .unwrap_or(false) as u8;
                 format!(
-                    "cur={} ({}) cache={} pending={} mem={:.1}MB total_files={} eye_queue={} eye_active={}",
+                    "cur={} file={} cur_loaded={} loaded={} cache={} pending={} mem={:.1}MB total={} eye_queue={} eye_active={}",
                     self.current_index, cur_path,
+                    cur_loaded, loaded,
                     self.compare_images.len(), self.prefetch_pending.len(),
                     mem_mb, self.image_files.len(),
                     self.eye_detect_queue.len(),
@@ -1148,6 +1157,16 @@ impl ImageViewerApp {
             }
             "next" => { self.next_image(ctx); ctx.request_repaint(); "ok".into() }
             "prev" => { self.prev_image(ctx); ctx.request_repaint(); "ok".into() }
+            // Slide the compare window one step to the right (same as SHIFT+Right).
+            "compare_add" => { self.compare_shift_right(ctx); ctx.request_repaint(); "ok".into() }
+            // Trigger eye detection on the current image (same as pressing E).
+            // Sets eye_force so poll_eye_detection bypasses the idle gate once.
+            "eye" => {
+                self.cycle_eye_focus();
+                self.eye_force = true;
+                ctx.request_repaint();
+                "ok".into()
+            }
             "open" if parts.len() == 2 => {
                 let path = PathBuf::from(parts[1]);
                 if path.exists() {
@@ -1164,7 +1183,7 @@ impl ImageViewerApp {
                 }
             }
             "help" | "" => {
-                "commands: status | perf | cache | next | prev | open <path>".into()
+                "commands: status | perf | cache | next | prev | compare_add | eye | open <path>".into()
             }
             other => format!("unknown: {} (try 'help')", other),
         }
@@ -1244,11 +1263,12 @@ impl ImageViewerApp {
             }
         }
 
-        // Start the next detection when the slot is free and the system is idle.
-        // Detection only reaches the queue via an explicit E keypress, so we never
-        // need to rush it — always respect the idle gate.
+        // Start the next detection when the slot is free.
+        // Normally waits for the prefetch burst to quiet down (idle gate).
+        // eye_force is set by the `eye` socket command to skip the gate once.
         if self.eye_detecting_for.is_none() && !self.eye_detect_queue.is_empty() {
-            let idle = self.prefetch_pending.len() < 4;
+            let idle = self.prefetch_pending.len() < 4 || self.eye_force;
+            self.eye_force = false;
             if idle {
                 self.run_next_detection();
             }
@@ -2257,15 +2277,20 @@ fn load_animated_gif_frames(path: &str) -> Result<Vec<(ColorImage, Duration)>, S
 }
 
 fn to_egui_color_image(img: DynamicImage) -> ColorImage {
-    // Fast path: RGB8 (the common format for embedded JPEG previews).
-    // Converts 3-byte RGB pixels directly to Color32 in parallel — avoids the
-    // intermediate RGBA allocation that into_rgba8() would require, and skips
-    // alpha premultiplication math (alpha is always 255 for these images).
+    // Fast path: RGB8 (all embedded JPEG previews).  Converts 3-byte RGB pixels
+    // directly to Color32 — avoids the intermediate RGBA allocation that
+    // into_rgba8() requires and skips alpha premultiplication (always 255).
+    //
+    // NOTE: intentionally NOT using rayon here.  This function is called from
+    // both priority OS-threads and background rayon tasks.  Priority OS-threads
+    // must not borrow from the global rayon pool: when background tasks fill
+    // the bounded sync_channel(8) they all block inside rayon, exhausting the
+    // pool and deadlocking any priority thread that tries to use par_iter.
     if let DynamicImage::ImageRgb8(rgb) = img {
         let w = rgb.width() as usize;
         let h = rgb.height() as usize;
         let pixels: Vec<egui::Color32> = rgb.as_raw()
-            .par_chunks_exact(3)
+            .chunks_exact(3)
             .map(|p| egui::Color32::from_rgb(p[0], p[1], p[2]))
             .collect();
         return ColorImage {
@@ -2274,11 +2299,10 @@ fn to_egui_color_image(img: DynamicImage) -> ColorImage {
             pixels,
         };
     }
-    // General path: convert to RGBA8, then build Color32 pixels in parallel.
     let rgba = img.into_rgba8();
     let (w, h) = rgba.dimensions();
     let pixels: Vec<egui::Color32> = rgba.as_raw()
-        .par_chunks_exact(4)
+        .chunks_exact(4)
         .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
         .collect();
     ColorImage {
