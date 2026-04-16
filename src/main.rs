@@ -133,6 +133,14 @@ struct ImageViewerApp {
     /// Loaded on demand; cleared when the current image changes.
     exif_data: Vec<(String, String, String)>,
     exif_for_index: Option<usize>,
+
+    // ── Startup: async directory scan ────────────────────────────────────────
+    /// Receives the full sorted file list from the background dir-scan thread.
+    /// Present only until the scan arrives; None afterwards.
+    dir_scan_rx: Option<mpsc::Receiver<Vec<PathBuf>>>,
+    /// Maps old order-position → new order-position for in-flight decode threads
+    /// that were launched before the dir scan updated image_order.
+    pos_remap: HashMap<usize, usize>,
 }
 
 impl ImageViewerApp {
@@ -188,29 +196,41 @@ impl ImageViewerApp {
             compare_offsets: HashMap::new(),
             exif_data: Vec::new(),
             exif_for_index: None,
+            dir_scan_rx: None,
+            pos_remap: HashMap::new(),
         };
         if let Some(path) = path {
-            app.gather_images_from_directory(&path);
-            if !app.image_files.is_empty() {
-                let cur = app.current_index;
-                app.compare_set = vec![cur];
-                app.compare_focus = 0;
+            // ── Instant first paint ────────────────────────────────────────────
+            // Register the clicked file immediately at order-pos 0 so we can
+            // show a thumbnail and start the full preview decode RIGHT NOW —
+            // without waiting for the directory scan to complete.
+            app.image_files = vec![path.clone()];
+            app.image_order = vec![0];
+            app.current_index = 0;
+            app.compare_set   = vec![0];
+            app.compare_focus = 0;
 
-                // Stage 0 — synchronous thumbnail for instant first paint.
-                // Reads only the tiny embedded thumbnail (~160×120, a few KB) from the
-                // RAW container. Completes in ~2 ms and puts something on screen
-                // before the full-res preview arrives from the background thread.
-                app.load_thumbnail_sync(cur, &cc.egui_ctx);
+            // Stage 0 — synchronous thumbnail (~2 ms) for instant first paint.
+            app.load_thumbnail_sync(0, &cc.egui_ctx);
 
-                // Stage 1 — full preview for the current image (one dedicated Rayon task).
-                // Triggers stages 2 & 3 (prefetch_adjacent + prefetch_all_remaining)
-                // automatically in poll_prefetch once this image arrives.
-                app.prefetch_images(&[cur]);
+            // Stage 1 — full preview decode on a dedicated OS thread.
+            // poll_prefetch kicks off prefetch_adjacent + prefetch_all_remaining
+            // automatically once this image arrives.
+            app.prefetch_images(&[0]);
 
-                cc.egui_ctx.request_repaint();
-            } else {
-                app.last_error = Some(format!("No supported images found in directory of '{}'", path.display()));
-            }
+            cc.egui_ctx.request_repaint();
+
+            // ── Background directory scan ──────────────────────────────────────
+            // Scan the folder on a separate thread so the first frame is never
+            // delayed by fs::read_dir.  Results arrive via dir_scan_rx and are
+            // merged in poll_dir_scan() on subsequent frames.
+            let (dir_tx, dir_rx) = mpsc::channel::<Vec<PathBuf>>();
+            app.dir_scan_rx = Some(dir_rx);
+            let scan_path = path.clone();
+            std::thread::spawn(move || {
+                let files = scan_image_directory(&scan_path);
+                let _ = dir_tx.send(files);
+            });
         } else {
             app.last_error = Some("No image file specified.".to_string());
         }
@@ -383,40 +403,71 @@ impl ImageViewerApp {
     }
 
     fn gather_images_from_directory(&mut self, file_path: &Path) {
-        let Some(parent_dir) = file_path.parent() else {
-            self.last_error = Some("Failed to get parent directory.".to_string());
-            return;
-        };
-
-        let all_supported_formats: Vec<&str> = [
-            &IMAGEREADER_SUPPORTED_FORMATS[..],
-            &ANIM_SUPPORTED_FORMATS[..],
-            &IMAGE_RS_SUPPORTED_FORMATS[..],
-            &RAW_SUPPORTED_FORMATS[..],
-            &FITS_SUPPORTED_FORMATS[..],
-            &JXL_SUPPORTED_FORMATS[..],
-        ]
-        .concat();
-
-        let Ok(entries) = fs::read_dir(parent_dir) else { return };
-        let mut files: Vec<PathBuf> = entries
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .filter(|path| {
-                path.is_file() && {
-                    let path_str = path.to_string_lossy().to_lowercase();
-                    all_supported_formats.iter().any(|fmt| path_str.ends_with(fmt))
-                }
-            })
-            .collect();
-
-        files.sort_by_key(|name| name.to_string_lossy().to_lowercase());
-
+        let files = scan_image_directory(file_path);
         if let Some(index) = files.iter().position(|p| p == file_path) {
             self.current_index = index;
         }
-
         self.image_files = files;
         self.image_order = (0..self.image_files.len()).collect();
+    }
+
+    /// Merge the background directory-scan result into app state.
+    ///
+    /// Called every frame from `logic()` until the scan arrives.  When it does:
+    ///   1. Find the clicked file's new position in the full sorted list.
+    ///   2. Remap any cached images / pending loads from the temporary pos-0 slot.
+    ///   3. Replace image_files / image_order / current_index.
+    ///   4. Kick off adjacent prefetch and full-folder background warming.
+    fn poll_dir_scan(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.dir_scan_rx.take() else { return };
+        match rx.try_recv() {
+            Ok(files) => {
+                // Find where the clicked file ended up after sorting.
+                let clicked = self.image_files[0].clone();
+                let new_idx = files.iter().position(|p| p == &clicked).unwrap_or(0);
+
+                // Remap the single cached/pending slot (old pos=0 → new_idx).
+                if new_idx != 0 {
+                    if let Some(img) = self.compare_images.remove(&0) {
+                        self.compare_images.insert(new_idx, img);
+                    }
+                    if self.prefetch_pending.remove(&0) {
+                        self.prefetch_pending.insert(new_idx);
+                        // Tell poll_prefetch to redirect the in-flight thread result.
+                        self.pos_remap.insert(0, new_idx);
+                    }
+                    // Remap eye-detect queue entries that reference old pos=0.
+                    for p in self.eye_detect_queue.iter_mut() {
+                        if *p == 0 { *p = new_idx; }
+                    }
+                    if self.eye_detecting_for == Some(0) {
+                        self.eye_detecting_for = Some(new_idx);
+                    }
+                }
+
+                self.image_files  = files;
+                self.image_order  = (0..self.image_files.len()).collect();
+                self.current_index = new_idx;
+                self.compare_set   = vec![new_idx];
+                self.compare_focus = 0;
+
+                let cur = self.current_index;
+                self.prefetch_adjacent(cur);
+                self.prefetch_all_remaining();
+                ctx.request_repaint();
+                // dir_scan_rx stays None — scan is done.
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                // Not ready yet — put the receiver back and keep polling.
+                self.dir_scan_rx = Some(rx);
+                ctx.request_repaint();
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // Thread died without sending — fall back: use the single file as the
+                // entire "directory" (already set up in new()). No rx to restore.
+                log::warn!("dir scan thread disconnected without result");
+            }
+        }
     }
     
     fn next_image(&mut self, ctx: &egui::Context) {
@@ -640,8 +691,10 @@ impl ImageViewerApp {
 
         // ── Priority channel: drain everything ──────────────────────────────
         let mut priority_drained = 0u32;
-        while let Ok((pos, color_image)) = self.priority_rx.try_recv() {
+        while let Ok((raw_pos, color_image)) = self.priority_rx.try_recv() {
             priority_drained += 1;
+            // Apply any position remap installed by poll_dir_scan.
+            let pos = self.pos_remap.remove(&raw_pos).unwrap_or(raw_pos);
             self.prefetch_pending.remove(&pos);
             if self.compare_images.get(&pos).map(|d| !d.is_thumbnail).unwrap_or(false) { continue; }
             any_new |= self.insert_decoded_image(pos, color_image, ctx);
@@ -651,8 +704,9 @@ impl ImageViewerApp {
         let mut bg_processed = 0u32;
         while bg_processed < 4 {
             match self.background_rx.try_recv() {
-                Ok((pos, color_image)) => {
+                Ok((raw_pos, color_image)) => {
                     bg_processed += 1;
+                    let pos = self.pos_remap.remove(&raw_pos).unwrap_or(raw_pos);
                     self.prefetch_pending.remove(&pos);
                     if self.compare_images.get(&pos).map(|d| !d.is_thumbnail).unwrap_or(false) { continue; }
                     self.insert_decoded_image(pos, color_image, ctx);
@@ -1392,6 +1446,7 @@ impl eframe::App for ImageViewerApp {
     /// Called before every `ui` call, and also when the window is hidden but
     /// `request_repaint` fired (eframe 0.34 API).  Non-UI background work goes here.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_dir_scan(ctx);  // merge background dir-scan before processing decoded images
         self.poll_prefetch(ctx);
         self.poll_eye_detection(ctx);
     }
@@ -2057,6 +2112,43 @@ fn apply_exif_orientation(img: DynamicImage, path: &Path) -> DynamicImage {
     }
 }
 
+/// Return a sorted list of all supported image files in the same directory as
+/// `file_path`.  Designed to be called from a background thread; no `self` access.
+fn scan_image_directory(file_path: &Path) -> Vec<PathBuf> {
+    let Some(parent_dir) = file_path.parent() else { return vec![file_path.to_path_buf()] };
+
+    let all_supported_formats: Vec<&str> = [
+        &IMAGEREADER_SUPPORTED_FORMATS[..],
+        &ANIM_SUPPORTED_FORMATS[..],
+        &IMAGE_RS_SUPPORTED_FORMATS[..],
+        &RAW_SUPPORTED_FORMATS[..],
+        &FITS_SUPPORTED_FORMATS[..],
+        &JXL_SUPPORTED_FORMATS[..],
+    ]
+    .concat();
+
+    let Ok(entries) = fs::read_dir(parent_dir) else { return vec![file_path.to_path_buf()] };
+
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| {
+            path.is_file() && {
+                let path_str = path.to_string_lossy().to_lowercase();
+                all_supported_formats.iter().any(|fmt| path_str.ends_with(fmt))
+            }
+        })
+        .collect();
+
+    files.sort_by_key(|name| name.to_string_lossy().to_lowercase());
+
+    // Ensure the clicked file is present even if read_dir didn't find it
+    // (e.g. permissions issue on a sibling file).
+    if files.is_empty() {
+        files.push(file_path.to_path_buf());
+    }
+    files
+}
+
 fn load_image(path: &Path) -> Result<LoadedImage, String> {
     let path_str = path.to_string_lossy();
     let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
@@ -2121,9 +2213,35 @@ fn load_animated_gif_frames(path: &str) -> Result<Vec<(ColorImage, Duration)>, S
 }
 
 fn to_egui_color_image(img: DynamicImage) -> ColorImage {
+    // Fast path: RGB8 (the common format for embedded JPEG previews).
+    // Converts 3-byte RGB pixels directly to Color32 in parallel — avoids the
+    // intermediate RGBA allocation that into_rgba8() would require, and skips
+    // alpha premultiplication math (alpha is always 255 for these images).
+    if let DynamicImage::ImageRgb8(rgb) = img {
+        let w = rgb.width() as usize;
+        let h = rgb.height() as usize;
+        let pixels: Vec<egui::Color32> = rgb.as_raw()
+            .par_chunks_exact(3)
+            .map(|p| egui::Color32::from_rgb(p[0], p[1], p[2]))
+            .collect();
+        return ColorImage {
+            size: [w, h],
+            source_size: Vec2::new(w as f32, h as f32),
+            pixels,
+        };
+    }
+    // General path: convert to RGBA8, then build Color32 pixels in parallel.
     let rgba = img.into_rgba8();
-    let dims = rgba.dimensions();
-    ColorImage::from_rgba_unmultiplied([dims.0 as _, dims.1 as _], rgba.as_raw())
+    let (w, h) = rgba.dimensions();
+    let pixels: Vec<egui::Color32> = rgba.as_raw()
+        .par_chunks_exact(4)
+        .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
+        .collect();
+    ColorImage {
+        size: [w as _, h as _],
+        source_size: Vec2::new(w as f32, h as f32),
+        pixels,
+    }
 }
 
 fn load_with_image_crate(path: &str) -> Result<DynamicImage, String> {
