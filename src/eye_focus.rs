@@ -13,12 +13,12 @@
 ///   2. Next to the running executable                      (installed release)
 ///   3. `~/.config/lightningview/seeta_fd_frontal_v1.0.bin` (user config)
 use egui::{ColorImage, Pos2, Vec2};
-use std::{
-    fs::File,
-    io::BufReader,
-    path::{Path, PathBuf},
-};
 use image::GenericImageView;
+use std::{
+    io::Cursor,
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
 const MODEL_FILENAME: &str = "seeta_fd_frontal_v1.0.bin";
 
@@ -118,6 +118,27 @@ pub fn prepare_gray_from_jpeg(jpeg_bytes: &[u8]) -> Option<(Vec<u8>, u32, u32, f
     Some((out, dw, dh, 1.0 / scale))
 }
 
+// ── model cache ───────────────────────────────────────────────────────────────
+
+/// Raw bytes of the face-detection model, loaded once and kept in RAM.
+/// Avoids re-reading the 1.2 MB file on every detection call (particularly
+/// important when the disk is busy with background prefetch I/O).
+static MODEL_CACHE: OnceLock<Vec<u8>> = OnceLock::new();
+
+fn cached_model_bytes() -> Option<&'static Vec<u8>> {
+    if let Some(bytes) = MODEL_CACHE.get() {
+        return Some(bytes);
+    }
+    let path = model_path()?;
+    let bytes = std::fs::read(&path)
+        .map_err(|e| log::warn!("Failed to read face model: {}", e))
+        .ok()?;
+    log::info!("Face model loaded into cache ({} bytes)", bytes.len());
+    // OnceLock::set may lose the race if another thread loaded first — that's fine.
+    let _ = MODEL_CACHE.set(bytes);
+    MODEL_CACHE.get()
+}
+
 // ── step 2: background thread ─────────────────────────────────────────────────
 
 /// Run face detection on a pre-scaled grayscale buffer and return estimated
@@ -126,26 +147,22 @@ pub fn prepare_gray_from_jpeg(jpeg_bytes: &[u8]) -> Option<(Vec<u8>, u32, u32, f
 /// `scale_inv` is the reciprocal of the scale that was used to produce `gray`
 /// (returned by `prepare_gray`).
 ///
-/// This loads the face model from disk on every call — it must run on a
-/// background thread, never on the UI thread.
+/// The face model is read from disk once and cached; subsequent calls parse
+/// from RAM.  Must still run on a background thread (cascade detection is slow).
 pub fn detect_from_gray(gray: Vec<u8>, w: u32, h: u32, scale_inv: f32) -> Vec<Pos2> {
-    let Some(path) = model_path() else {
-        log::warn!(
-            "Eye detection disabled: {MODEL_FILENAME} not found. \
-             To enable: mkdir assets && curl -sSL -o assets/{MODEL_FILENAME} \
-             https://github.com/atomashpolskiy/rustface/raw/master/model/{MODEL_FILENAME}"
-        );
-        return vec![];
-    };
-
-    let file = match File::open(&path) {
-        Ok(f) => f,
-        Err(e) => {
-            log::warn!("Failed to open face detection model at {}: {}", path.display(), e);
+    let model_bytes = match cached_model_bytes() {
+        Some(b) => b,
+        None => {
+            log::warn!(
+                "Eye detection disabled: {MODEL_FILENAME} not found. \
+                 To enable: mkdir assets && curl -sSL -o assets/{MODEL_FILENAME} \
+                 https://github.com/atomashpolskiy/rustface/raw/master/model/{MODEL_FILENAME}"
+            );
             return vec![];
         }
     };
-    let model = match rustface::read_model(BufReader::new(file)) {
+
+    let model = match rustface::read_model(Cursor::new(model_bytes)) {
         Ok(m) => m,
         Err(e) => {
             log::warn!("Failed to parse face detection model: {}", e);
