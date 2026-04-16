@@ -144,6 +144,9 @@ impl ImageViewerApp {
         let (background_tx, background_rx) = mpsc::sync_channel(8);
         // Eye detection results arrive here from the background thread.
         let (eye_tx, eye_rx) = mpsc::channel::<(usize, Vec<egui::Pos2>)>();
+        // Pre-warm the face model into RAM so the first detection doesn't
+        // pay the disk-read cost (1.2 MB) while under load.
+        std::thread::spawn(eye_focus::prewarm_model);
         let mut app = Self {
             compare_images: HashMap::new(),
             compare_set: Vec::new(),
@@ -719,11 +722,16 @@ impl ImageViewerApp {
             self.compare_images.len(),
         );
         // Queue for background eye detection if not already cached or in-flight.
+        // Current image goes to the front so it is detected before neighbours.
         if !self.eye_results.contains_key(&pos)
             && self.eye_detecting_for != Some(pos)
             && !self.eye_detect_queue.contains(&pos)
         {
-            self.eye_detect_queue.push_back(pos);
+            if pos == self.current_index {
+                self.eye_detect_queue.push_front(pos);
+            } else {
+                self.eye_detect_queue.push_back(pos);
+            }
         }
 
         if pos == self.current_index {
@@ -1139,13 +1147,16 @@ impl ImageViewerApp {
             }
         }
 
-        // Only start background detection when the prefetch backlog is calm.
-        // This avoids competing with the initial burst of image loading I/O.
-        if self.eye_detecting_for.is_none()
-            && !self.eye_detect_queue.is_empty()
-            && self.prefetch_pending.len() < 20
-        {
-            self.run_next_detection();
+        // Start the next detection when the slot is free.
+        // The current image is started immediately — the user may be waiting for it.
+        // All other images respect the idle gate (prefetch_pending < 20) to avoid
+        // competing with the initial burst of image-loading disk I/O.
+        if self.eye_detecting_for.is_none() && !self.eye_detect_queue.is_empty() {
+            let next_is_current = self.eye_detect_queue.front() == Some(&self.current_index);
+            let idle = self.prefetch_pending.len() < 20;
+            if next_is_current || idle {
+                self.run_next_detection();
+            }
         }
 
         if self.eye_detecting_for.is_some() {

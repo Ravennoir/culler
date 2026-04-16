@@ -198,6 +198,13 @@ pub fn detect_from_gray(gray: Vec<u8>, w: u32, h: u32, scale_inv: f32) -> Vec<Po
     eyes
 }
 
+/// Load the face-detection model into the in-memory cache without running any
+/// detection.  Call this once at startup in a background thread so the first
+/// actual detection call doesn't pay the disk-I/O cost.
+pub fn prewarm_model() {
+    cached_model_bytes();
+}
+
 // ── convenience wrapper (used by tests) ──────────────────────────────────────
 
 /// Detect eye positions in a `ColorImage` in one call.
