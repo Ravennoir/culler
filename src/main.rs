@@ -110,19 +110,18 @@ struct ImageViewerApp {
     show_info_overlay: bool,
     undo_stack: Vec<UndoAction>,
     show_exif_overlay: bool,
-    /// Detected eye positions (full-res pixel coords) for the currently viewed image.
-    eye_positions: Vec<egui::Pos2>,
-    /// Index into `eye_positions` — which eye is currently centred.
+    /// Pre-computed eye positions keyed by order_pos.  Results are kept for
+    /// the lifetime of the session (each entry is just a few Pos2 values).
+    eye_results: HashMap<usize, Vec<egui::Pos2>>,
+    /// Images waiting for eye detection, in priority order (front = highest).
+    eye_detect_queue: std::collections::VecDeque<usize>,
+    /// order_pos of the image currently being detected on the background thread.
+    eye_detecting_for: Option<usize>,
+    /// Index into the detected eyes for the currently-viewed image.
     eye_index: usize,
-    /// The `current_index` for which `eye_positions` was computed.
-    eye_positions_for: Option<usize>,
     /// Receives `(order_pos, eye_positions)` from the background detection thread.
     eye_rx: mpsc::Receiver<(usize, Vec<egui::Pos2>)>,
     eye_tx: mpsc::Sender<(usize, Vec<egui::Pos2>)>,
-    /// True while a detection thread is running — prevents double-spawning.
-    eye_detection_pending: bool,
-    /// True when the last detection finished with no faces found.
-    eye_no_face: bool,
     /// View size from the previous frame, used when 'E' is handled before layout.
     last_view_size: Vec2,
     show_help_overlay: bool,
@@ -175,13 +174,12 @@ impl ImageViewerApp {
             undo_stack: Vec::new(),
             show_exif_overlay: false,
             show_help_overlay: false,
-            eye_positions: Vec::new(),
+            eye_results: HashMap::new(),
+            eye_detect_queue: std::collections::VecDeque::new(),
+            eye_detecting_for: None,
             eye_index: 0,
-            eye_positions_for: None,
             eye_rx,
             eye_tx,
-            eye_detection_pending: false,
-            eye_no_face: false,
             last_view_size: Vec2::new(1920.0, 1080.0),
             compare_zoom: 1.0,
             compare_offsets: HashMap::new(),
@@ -720,6 +718,14 @@ impl ImageViewerApp {
             bytes as f64 / 1_048_576.0,
             self.compare_images.len(),
         );
+        // Queue for background eye detection if not already cached or in-flight.
+        if !self.eye_results.contains_key(&pos)
+            && self.eye_detecting_for != Some(pos)
+            && !self.eye_detect_queue.contains(&pos)
+        {
+            self.eye_detect_queue.push_back(pos);
+        }
+
         if pos == self.current_index {
             self.is_scaled_to_fit = true;
             return true;
@@ -1061,115 +1067,88 @@ impl ImageViewerApp {
 
     /// Called when the user presses 'E'.
     ///
-    /// First press on a new image: downscales to grayscale on the UI thread
-    /// (~5 ms) then hands detection off to a background thread (~100–400 ms).
-    /// The zoom is applied once the result arrives via `poll_eye_detection`.
-    ///
-    /// Subsequent presses (same image, result already cached) cycle through
-    /// the detected eyes immediately ("reroll").
+    /// If a result is already cached for this image: cycle through the detected
+    /// eyes immediately.  Otherwise bump the image to the front of the detection
+    /// queue and start detection now (the user is explicitly waiting).
     fn cycle_eye_focus(&mut self) {
         let idx = self.current_index;
-        log::info!("cycle_eye_focus: idx={} for={:?} pending={}", idx, self.eye_positions_for, self.eye_detection_pending);
 
-        // Cached result for this image → just cycle.
-        if self.eye_positions_for == Some(idx) {
-            log::info!("cycle_eye_focus: cached {} eye(s), cycling", self.eye_positions.len());
-            if !self.eye_positions.is_empty() {
-                self.eye_index = (self.eye_index + 1) % self.eye_positions.len();
-                self.apply_eye_zoom();
+        if let Some(positions) = self.eye_results.get(&idx) {
+            if !positions.is_empty() {
+                let len = positions.len();
+                self.eye_index = (self.eye_index + 1) % len;
+                let eye_pos = positions[self.eye_index];
+                self.apply_eye_zoom(eye_pos);
             }
             return;
         }
 
-        // Detection already running for this image → ignore the keypress.
-        if self.eye_detection_pending {
-            log::info!("cycle_eye_focus: detection already pending, ignoring");
-            return;
+        // Not cached yet — move to front of queue so detection starts ASAP.
+        self.eye_detect_queue.retain(|&p| p != idx);
+        self.eye_detect_queue.push_front(idx);
+        if self.eye_detecting_for.is_none() {
+            self.run_next_detection();
         }
-
-        let Some(img) = self.compare_images.get(&idx) else {
-            log::info!("cycle_eye_focus: image not in cache, cannot detect");
-            return;
-        };
-        if img.is_thumbnail {
-            log::info!("cycle_eye_focus: image is still a thumbnail, skipping");
-            return;
-        }
-
-        // For RAW files extract the embedded JPEG directly (capped at 2 MP) so
-        // detection never runs on a full 24 MP decode.  Fall back to full_res_image
-        // for non-RAW formats or when no embedded JPEG is found.
-        let path = self.image_files.get(self.image_order[idx]).cloned();
-        let ext = path.as_ref()
-            .and_then(|p| p.extension())
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_lowercase())
-            .unwrap_or_default();
-
-        let jpeg_gray = if RAW_SUPPORTED_FORMATS.contains(&ext.as_str()) {
-            path.as_ref()
-                .and_then(|p| raw_preview::extract_preview_jpeg_capped(p, 2_000_000))
-                .and_then(|jpeg| eye_focus::prepare_gray_from_jpeg(&jpeg))
-        } else {
-            None
-        };
-        let (gray, w, h, scale_inv) = jpeg_gray
-            .unwrap_or_else(|| eye_focus::prepare_gray(&img.full_res_image));
-
-        log::info!(
-            "cycle_eye_focus: spawning detection thread for idx={} gray={}x{} source={}",
-            idx, w, h, if RAW_SUPPORTED_FORMATS.contains(&ext.as_str()) { "embedded-jpeg" } else { "full_res_image" }
-        );
-        self.eye_no_face = false;
-
-        let tx = self.eye_tx.clone();
-        std::thread::spawn(move || {
-            let positions = eye_focus::detect_from_gray(gray, w, h, scale_inv);
-            log::info!("detection thread: found {} position(s) for idx={}", positions.len(), idx);
-            let _ = tx.send((idx, positions));
-        });
-        self.eye_detection_pending = true;
     }
 
-    /// Apply the current eye zoom using `self.eye_positions[self.eye_index]`.
-    fn apply_eye_zoom(&mut self) {
-        let Some(&eye_pos) = self.eye_positions.get(self.eye_index) else { return };
+    /// Zoom to `eye_pos` in full-resolution image coordinates.
+    fn apply_eye_zoom(&mut self, eye_pos: egui::Pos2) {
         self.zoom = eye_focus::EYE_ZOOM;
         self.offset = eye_focus::eye_zoom_offset(eye_pos, eye_focus::EYE_ZOOM, self.last_view_size);
         self.is_scaled_to_fit = false;
         self.velocity = Vec2::ZERO;
-        log::info!(
-            "Eye focus: eye {} of {} at ({:.0}, {:.0})",
-            self.eye_index + 1,
-            self.eye_positions.len(),
-            eye_pos.x,
-            eye_pos.y,
-        );
+        log::info!("Eye focus: zoomed to ({:.0}, {:.0})", eye_pos.x, eye_pos.y);
     }
 
-    /// Drain the eye detection channel. Called every frame from `logic()`.
+    /// Pop the next item from the detection queue and spawn a detection thread.
+    /// Uses `full_res_image` already in the compare_images cache — no disk I/O.
+    fn run_next_detection(&mut self) {
+        while let Some(idx) = self.eye_detect_queue.pop_front() {
+            if self.eye_results.contains_key(&idx) { continue; }
+            let img = match self.compare_images.get(&idx) {
+                Some(img) if !img.is_thumbnail => img,
+                _ => continue,
+            };
+            let (gray, w, h, scale_inv) = eye_focus::prepare_gray(&img.full_res_image);
+            let tx = self.eye_tx.clone();
+            std::thread::spawn(move || {
+                let positions = eye_focus::detect_from_gray(gray, w, h, scale_inv);
+                log::info!("detection thread: idx={} found={}", idx, positions.len());
+                let _ = tx.send((idx, positions));
+            });
+            self.eye_detecting_for = Some(idx);
+            log::info!("Eye detection: started for idx={}", idx);
+            return;
+        }
+    }
+
+    /// Drain the detection channel and start the next queued detection when idle.
+    /// "Idle" means the prefetch backlog is small enough that disk/CPU are free.
+    /// Called every frame from `logic()`.
     fn poll_eye_detection(&mut self, ctx: &egui::Context) {
         while let Ok((idx, positions)) = self.eye_rx.try_recv() {
-            self.eye_detection_pending = false;
-            // Discard stale results for images the user has already navigated away from.
-            if idx != self.current_index {
-                continue;
-            }
-            if positions.is_empty() {
-                log::info!("Eye focus: no faces detected.");
-                self.eye_no_face = true;
-            } else {
-                self.eye_no_face = false;
-                self.eye_positions = positions;
-                self.eye_positions_for = Some(idx);
+            self.eye_detecting_for = None;
+            log::info!("Eye detection: result idx={} faces={}", idx, positions.len());
+            self.eye_results.insert(idx, positions.clone());
+            if idx == self.current_index {
                 self.eye_index = 0;
-                self.apply_eye_zoom();
+                if let Some(pos) = positions.first().copied() {
+                    self.apply_eye_zoom(pos);
+                }
+                ctx.request_repaint();
             }
-            ctx.request_repaint();
         }
-        // Keep the event loop ticking while detection is in flight so the result
-        // is applied as soon as it arrives — same pattern as poll_prefetch.
-        if self.eye_detection_pending {
+
+        // Only start background detection when the prefetch backlog is calm.
+        // This avoids competing with the initial burst of image loading I/O.
+        if self.eye_detecting_for.is_none()
+            && !self.eye_detect_queue.is_empty()
+            && self.prefetch_pending.len() < 20
+        {
+            self.run_next_detection();
+        }
+
+        if self.eye_detecting_for.is_some() {
             ctx.request_repaint();
         }
     }
@@ -1196,7 +1175,6 @@ impl ImageViewerApp {
                 // 'e' — eye focus. Caught via Text event (same as '?') as a
                 // robust fallback in case key_pressed misses it.
                 egui::Event::Text(t) if t == "e" || t == "E" => {
-                    log::info!("E via Text event");
                     self.cycle_eye_focus();
                 }
                 _ => {}
@@ -1270,7 +1248,6 @@ impl ImageViewerApp {
         }
         // E: zoom to detected eye / cycle to next eye (reroll)
         if ctx.input(|i| i.key_pressed(egui::Key::E)) && !shift && !alt {
-            log::info!("E key pressed");
             self.cycle_eye_focus();
         }
         // Invalidate EXIF cache whenever the displayed image changes
@@ -1753,9 +1730,14 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
             }
 
             // Eye-detection status badge — top-right corner
-            let eye_badge: Option<(&str, Color32)> = if self.eye_detection_pending {
+            let detecting_current = self.eye_detecting_for == Some(self.current_index)
+                || self.eye_detect_queue.front() == Some(&self.current_index);
+            let no_face_current = self.eye_results.get(&self.current_index)
+                .map(|p| p.is_empty())
+                .unwrap_or(false);
+            let eye_badge: Option<(&str, Color32)> = if detecting_current {
                 Some(("EYE...", Color32::from_rgb(100, 180, 255)))
-            } else if self.eye_no_face {
+            } else if no_face_current {
                 Some(("NO FACE", Color32::from_rgb(220, 80, 80)))
             } else {
                 None
