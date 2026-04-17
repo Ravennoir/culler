@@ -1734,14 +1734,16 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                 let rating = *self.ratings.get(current_path).unwrap_or(&0);
                 let stars: String = (1u8..=5).map(|i| if i <= rating { '★' } else { '☆' }).collect();
 
-                // Compact EXIF line: tag name + optional prefix override
+                // Compact EXIF line — (tag, prefix glyph/icon)
+                // ⊙ shutter  ƒ/ aperture  ↔ focal-length  ◎ lens  ▲ ISO  ☀ white-balance
                 const EXIF_INFO_TAGS: &[(&str, &str)] = &[
-                    ("ExposureTime",     ""),
-                    ("FNumber",          "f/"),
-                    ("FocalLength",      ""),
-                    ("LensSpecification",""),
-                    ("ColorSpace",       ""),
-                    ("WhiteBalance",     ""),
+                    ("ExposureTime",           "⊙ "),
+                    ("FNumber",                "ƒ/"),
+                    ("FocalLength",            "↔ "),
+                    ("PhotographicSensitivity","▲ "),
+                    ("LensSpecification",      "◎ "),
+                    ("ColorSpace",             ""),
+                    ("WhiteBalance",           "☀ "),
                 ];
                 let exif_line = EXIF_INFO_TAGS.iter()
                     .filter_map(|&(tag, prefix)| {
@@ -1794,7 +1796,7 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                 ui.painter().text(
                     bar_rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    path_str.as_ref(),
+                    &format!("▸  {path_str}"),
                     egui::FontId::proportional(13.0),
                     Color32::from_gray(190),
                 );
