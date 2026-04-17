@@ -2499,6 +2499,8 @@ fn load_with_image_crate(path: &str) -> Result<DynamicImage, String> {
     log::debug!("Loading with image-rs: {}", path);
     ImageReader::open(path)
         .map_err(|e| format!("Failed to open {}: {}", path, e))?
+        .with_guessed_format()
+        .map_err(|e| format!("Failed to read {}: {}", path, e))?
         .decode()
         .map_err(|e| format!("Failed to decode {}: {}", path, e))
 }
