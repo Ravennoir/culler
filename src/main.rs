@@ -1618,6 +1618,15 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                                     bar_rect.center(), egui::Align2::CENTER_CENTER,
                                     &label, font_id, Color32::from_gray(190),
                                 );
+                                let ext = path.extension().and_then(|e| e.to_str())
+                                    .map(|e| e.to_lowercase()).unwrap_or_default();
+                                let is_full_raw_decode = self.compare_images.get(&order_pos)
+                                    .map(|d| !d.is_raw_preview && !d.is_thumbnail)
+                                    .unwrap_or(false)
+                                    && RAW_SUPPORTED_FORMATS.contains(&ext.as_str());
+                                if is_full_raw_decode {
+                                    draw_raw_badge(&painter, bar_rect);
+                                }
 
                                 // Bottom: rating + compact EXIF
                                 let rating = *self.ratings.get(&path).unwrap_or(&0);
@@ -1975,6 +1984,15 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                     bar_rect.center(), egui::Align2::CENTER_CENTER,
                     &label, font_id, Color32::from_gray(190),
                 );
+                let cur_ext = current_path.extension().and_then(|e| e.to_str())
+                    .map(|e| e.to_lowercase()).unwrap_or_default();
+                let is_full_raw_decode = self.compare_images.get(&self.current_index)
+                    .map(|d| !d.is_raw_preview && !d.is_thumbnail)
+                    .unwrap_or(false)
+                    && RAW_SUPPORTED_FORMATS.contains(&cur_ext.as_str());
+                if is_full_raw_decode {
+                    draw_raw_badge(ui.painter(), bar_rect);
+                }
             }
 
             // Culling mode HUD — top bar
@@ -2353,6 +2371,21 @@ fn load_animated_gif_frames(path: &str) -> Result<Vec<(ColorImage, Duration)>, S
             (color_image, delay)
         })
         .collect())
+}
+
+/// Subtle "RAW" badge at the right edge of the filepath bar, shown after a
+/// full sensor decode has replaced the embedded-JPEG preview.
+fn draw_raw_badge(painter: &egui::Painter, bar_rect: Rect) {
+    let font   = egui::FontId::proportional(10.0);
+    let color  = Color32::from_rgba_unmultiplied(60, 160, 100, 200);
+    let text   = "RAW";
+    let text_w = painter.layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE).size().x;
+    let badge  = Rect::from_min_max(
+        Pos2::new(bar_rect.max.x - text_w - 12.0, bar_rect.min.y + 5.0),
+        Pos2::new(bar_rect.max.x - 4.0,           bar_rect.max.y - 5.0),
+    );
+    painter.rect_filled(badge, 3.0, color);
+    painter.text(badge.center(), egui::Align2::CENTER_CENTER, text, font, Color32::WHITE);
 }
 
 fn to_egui_color_image(img: DynamicImage) -> ColorImage {
