@@ -113,6 +113,9 @@ struct DisplayableImage {
     /// True when this slot holds only a tiny thumbnail — a full-res preview is still loading.
     /// The full preview will replace this entry when it arrives.
     is_thumbnail: bool,
+    /// True when displaying an embedded JPEG preview extracted from a RAW container.
+    /// False for native images (JPEG, PNG, …) and for full sensor-resolution RAW decodes.
+    is_raw_preview: bool,
 }
 
 // Simplified enum for loaded image data before GPU upload
@@ -192,6 +195,8 @@ struct ImageViewerApp {
     cmd_listener: Option<UnixListener>,
     /// Ring buffer of recent decode times: (order_pos, path_stem, decode_ms).
     load_times: std::collections::VecDeque<(usize, String, u64)>,
+    /// order_pos values for which a full RAW decode has already been dispatched.
+    full_raw_requested: HashSet<usize>,
 }
 
 impl ImageViewerApp {
@@ -248,6 +253,7 @@ impl ImageViewerApp {
                 })
             },
             load_times: std::collections::VecDeque::with_capacity(64),
+            full_raw_requested: HashSet::new(),
         };
         if let Some(path) = path {
             // scan_image_directory uses DirEntry::file_type() — no extra stat() per
@@ -385,6 +391,30 @@ impl ImageViewerApp {
         }
     }
 
+    /// Spawn a priority thread to decode the current image from raw sensor data at native
+    /// resolution, bypassing the embedded JPEG preview. Only fires for RAW files.
+    fn request_full_raw_decode(&mut self, ctx: &egui::Context) {
+        let order_pos = self.current_index;
+        if self.full_raw_requested.contains(&order_pos) { return; }
+        let Some(&file_idx) = self.image_order.get(order_pos) else { return };
+        let Some(path) = self.image_files.get(file_idx).cloned() else { return };
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+        if !RAW_SUPPORTED_FORMATS.contains(&ext.as_str()) { return; }
+        self.full_raw_requested.insert(order_pos);
+        let tx = self.priority_tx.clone();
+        std::thread::spawn(move || {
+            let t = Instant::now();
+            match load_raw_full(&path) {
+                Ok(img) => {
+                    let color_image = to_egui_color_image(apply_exif_orientation(img, &path));
+                    let _ = tx.send((order_pos, color_image, t.elapsed().as_millis() as u64));
+                }
+                Err(e) => log::error!("Full RAW decode failed: {e}"),
+            }
+        });
+        ctx.request_repaint();
+    }
+
     /// Queue a background load for `order_pos` if not already cached or in-flight.
     /// Shows a thumbnail immediately for RAW files while the full preview loads.
     fn ensure_image_loaded(&mut self, order_pos: usize, ctx: &egui::Context) {
@@ -424,6 +454,7 @@ impl ImageViewerApp {
             tile_cache: HashMap::new(),
             needs_tiling: false, // thumbnails are tiny, never need tiling
             is_thumbnail: true,
+            is_raw_preview: true, // thumbnail is always extracted from RAW
         });
     }
 
@@ -661,8 +692,16 @@ impl ImageViewerApp {
             priority_drained += 1;
             self.prefetch_pending.remove(&pos);
             self.record_load_time(pos, decode_ms);
-            if self.compare_images.get(&pos).map(|d| !d.is_thumbnail).unwrap_or(false) { continue; }
-            any_new |= self.insert_decoded_image(pos, color_image, ctx);
+            let is_full_raw = self.full_raw_requested.contains(&pos);
+            let already_full = self.compare_images.get(&pos).map(|d| !d.is_thumbnail).unwrap_or(false);
+            if already_full && !is_full_raw { continue; }
+            let is_raw_preview = !is_full_raw && self.image_order.get(pos)
+                .and_then(|&fi| self.image_files.get(fi))
+                .and_then(|p| p.extension())
+                .and_then(|e| e.to_str())
+                .map(|e| RAW_SUPPORTED_FORMATS.contains(&e.to_lowercase().as_str()))
+                .unwrap_or(false);
+            any_new |= self.insert_decoded_image(pos, color_image, is_raw_preview, ctx);
         }
 
         // ── Background channel: at most 4 per frame ─────────────────────────
@@ -674,7 +713,13 @@ impl ImageViewerApp {
                     self.prefetch_pending.remove(&pos);
                     self.record_load_time(pos, decode_ms);
                     if self.compare_images.get(&pos).map(|d| !d.is_thumbnail).unwrap_or(false) { continue; }
-                    self.insert_decoded_image(pos, color_image, ctx);
+                    let is_raw_preview = self.image_order.get(pos)
+                        .and_then(|&fi| self.image_files.get(fi))
+                        .and_then(|p| p.extension())
+                        .and_then(|e| e.to_str())
+                        .map(|e| RAW_SUPPORTED_FORMATS.contains(&e.to_lowercase().as_str()))
+                        .unwrap_or(false);
+                    self.insert_decoded_image(pos, color_image, is_raw_preview, ctx);
                 }
                 Err(_) => break,
             }
@@ -708,7 +753,7 @@ impl ImageViewerApp {
 
     /// Insert a decoded ColorImage into compare_images and return true if it
     /// was the current image (triggers a scale-to-fit reset).
-    fn insert_decoded_image(&mut self, pos: usize, color_image: ColorImage, ctx: &egui::Context) -> bool {
+    fn insert_decoded_image(&mut self, pos: usize, color_image: ColorImage, is_raw_preview: bool, ctx: &egui::Context) -> bool {
         let Some(&file_idx) = self.image_order.get(pos) else { return false };
         let Some(path) = self.image_files.get(file_idx).cloned() else { return false };
         let max_texture_side = 2048;
@@ -730,6 +775,7 @@ impl ImageViewerApp {
             tile_cache: HashMap::new(),
             needs_tiling,
             is_thumbnail: false,
+            is_raw_preview,
         });
         log::debug!(
             "cache insert pos={} path={} size={}×{} mem={:.1}MB cache_count={}",
@@ -1282,8 +1328,13 @@ impl ImageViewerApp {
         if ctx.input(|i| i.key_pressed(egui::Key::F)) {
             self.is_fullscreen = !self.is_fullscreen;
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && !alt {
             self.is_scaled_to_fit = !self.is_scaled_to_fit;
+        }
+        // Alt+Enter: decode selected image from raw sensor data at full resolution.
+        // Only meaningful for RAW files; no-op for other formats.
+        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && alt {
+            self.request_full_raw_decode(ctx);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
             self.show_delete_confirmation = true;
@@ -2039,6 +2090,7 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                     ("Drag",                 "Pan image"),
                     ("Middle click",         "Reset zoom & pan"),
                     ("Enter",                "Scale to fit"),
+                    ("Alt+Enter",            "Decode full RAW at sensor resolution"),
                     ("F",                    "Toggle fullscreen"),
                     ("E",                    "Zoom to detected eye / next eye"),
                     ("Ctrl+C",               "Copy image to clipboard"),
@@ -2442,6 +2494,20 @@ fn load_raw(path: &str) -> Result<DynamicImage, String> {
         .map_err(|e| format!("Failed to load RAW: {}", e))?;
     let decoded = pipeline.output_8bit(None)
         .map_err(|e| format!("Failed to process RAW: {}", e))?;
+    image::RgbImage::from_raw(decoded.width as u32, decoded.height as u32, decoded.data)
+        .map(DynamicImage::ImageRgb8)
+        .ok_or_else(|| "Failed to create image from RAW data".to_string())
+}
+
+/// Full RAW decode via imagepipe — bypasses embedded JPEG previews entirely.
+/// Produces native-sensor-resolution output; may take several seconds.
+fn load_raw_full(path: &Path) -> Result<DynamicImage, String> {
+    let path_str = path.to_str().unwrap_or("");
+    log::debug!("Full RAW decode (sensor res) for {}", path_str);
+    let mut pipeline = imagepipe::Pipeline::new_from_file(path_str)
+        .map_err(|e| format!("Failed to load RAW: {e}"))?;
+    let decoded = pipeline.output_8bit(None)
+        .map_err(|e| format!("Failed to process RAW: {e}"))?;
     image::RgbImage::from_raw(decoded.width as u32, decoded.height as u32, decoded.data)
         .map(DynamicImage::ImageRgb8)
         .ok_or_else(|| "Failed to create image from RAW data".to_string())
