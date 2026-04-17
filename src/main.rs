@@ -123,6 +123,9 @@ struct ImageViewerApp {
     /// Loaded on demand; cleared when the current image changes.
     exif_data: Vec<(String, String, String)>,
     exif_for_index: Option<usize>,
+    /// Per-image EXIF cache used in compare mode so every column can show its
+    /// own data.  Populated lazily; never cleared (EXIF rows are tiny).
+    exif_cache: HashMap<usize, Vec<(String, String, String)>>,
 
     // ── CLI control socket ────────────────────────────────────────────────────
     /// Unix domain socket for in-process CLI commands (macOS/Linux).
@@ -175,6 +178,7 @@ impl ImageViewerApp {
             compare_offsets: HashMap::new(),
             exif_data: Vec::new(),
             exif_for_index: None,
+            exif_cache: HashMap::new(),
             #[cfg(unix)]
             cmd_listener: {
                 let path = "/tmp/lightningview.sock";
@@ -958,33 +962,23 @@ impl ImageViewerApp {
         self.is_scaled_to_fit = true;
     }
 
-    /// Read EXIF from the current image and cache it in `exif_data`.
-    /// Groups fields by IFD, skips thumbnail IFD (In1), sorts alphabetically within each group.
+    /// Load and cache EXIF for `idx` into `exif_cache` (no-op if already present).
+    fn ensure_exif_cached(&mut self, idx: usize) {
+        if self.exif_cache.contains_key(&idx) { return; }
+        let Some(&file_idx) = self.image_order.get(idx) else { return };
+        let Some(path) = self.image_files.get(file_idx).cloned() else { return };
+        let rows = read_exif_rows(&path);
+        self.exif_cache.insert(idx, rows);
+    }
+
+    /// Ensure the current image's EXIF is loaded and mirror it into `exif_data`
+    /// so the full EXIF side-panel (show_exif_overlay) continues to work.
     fn load_exif_for_current(&mut self) {
         let idx = self.current_index;
-        if self.exif_for_index == Some(idx) { return; } // already cached
-        self.exif_data.clear();
+        if self.exif_for_index == Some(idx) { return; }
         self.exif_for_index = Some(idx);
-
-        let Some(path) = self.image_files.get(self.image_order[idx]) else { return };
-        let Ok(file) = std::fs::File::open(path) else { return };
-        let mut buf = BufReader::new(file);
-        let Ok(exif) = ExifReader::new().read_from_container(&mut buf) else { return };
-
-        // Collect all fields, skipping thumbnail IFD.
-        let mut rows: Vec<(String, String, String)> = exif
-            .fields()
-            .filter(|f| f.ifd_num != In::THUMBNAIL)
-            .map(|f| (
-                format!("{}", f.ifd_num),
-                format!("{}", f.tag),
-                f.display_value().with_unit(&exif).to_string(),
-            ))
-            .collect();
-
-        // Sort: group by IFD label, then alphabetically by tag name.
-        rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-        self.exif_data = rows;
+        self.ensure_exif_cached(idx);
+        self.exif_data = self.exif_cache.get(&idx).cloned().unwrap_or_default();
     }
 
     fn ratings_file_path() -> Option<PathBuf> {
@@ -1489,6 +1483,72 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                         // Image is still loading — show a spinner in the column centre.
                         let spinner_rect = Rect::from_center_size(col_rect.center(), Vec2::splat(32.0));
                         ui.scope_builder(egui::UiBuilder::new().max_rect(spinner_rect), |ui| { ui.spinner(); });
+                    }
+
+                    // ── Per-column info overlay ───────────────────────────────
+                    if self.show_info_overlay && !self.image_files.is_empty() {
+                        if let Some(&file_idx) = self.image_order.get(order_pos) {
+                            if let Some(path) = self.image_files.get(file_idx).cloned() {
+                                // Top: filename bar
+                                let filename = path.file_name()
+                                    .unwrap_or_default().to_string_lossy().into_owned();
+                                let bar_h = 26.0;
+                                let bar_rect = Rect::from_min_max(
+                                    col_rect.min,
+                                    Pos2::new(col_rect.max.x, col_rect.min.y + bar_h),
+                                );
+                                painter.rect_filled(bar_rect, 0.0, Color32::from_black_alpha(180));
+                                painter.text(
+                                    bar_rect.center(), egui::Align2::CENTER_CENTER,
+                                    &format!("▸  {filename}"),
+                                    egui::FontId::proportional(13.0), Color32::from_gray(190),
+                                );
+
+                                // Bottom: rating + compact EXIF
+                                let rating = *self.ratings.get(&path).unwrap_or(&0);
+                                let stars: String = (1u8..=5)
+                                    .map(|i| if i <= rating { '★' } else { '☆' }).collect();
+
+                                self.ensure_exif_cached(order_pos);
+                                const EXIF_COLS: &[(&str, &str)] = &[
+                                    ("ExposureTime",           "⊙ "),
+                                    ("FNumber",                "ƒ/"),
+                                    ("FocalLength",            "↔ "),
+                                    ("PhotographicSensitivity","▲ "),
+                                    ("WhiteBalance",           "☀ "),
+                                ];
+                                let exif_line = if let Some(rows) = self.exif_cache.get(&order_pos) {
+                                    EXIF_COLS.iter()
+                                        .filter_map(|&(tag, pfx)| {
+                                            rows.iter()
+                                                .find(|(_, t, _)| t == tag)
+                                                .map(|(_, _, v)| format!("{pfx}{v}"))
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("  ·  ")
+                                } else { String::new() };
+
+                                let stars_h = 36.0;
+                                let exif_h  = if exif_line.is_empty() { 0.0 } else { 22.0 };
+                                let bot_rect = Rect::from_min_max(
+                                    Pos2::new(col_rect.min.x, col_rect.max.y - stars_h - exif_h),
+                                    col_rect.max,
+                                );
+                                painter.rect_filled(bot_rect, 0.0, Color32::from_black_alpha(180));
+                                painter.text(
+                                    Pos2::new(bot_rect.center().x, bot_rect.min.y + stars_h / 2.0),
+                                    egui::Align2::CENTER_CENTER, &stars,
+                                    egui::FontId::proportional(22.0), Color32::from_gray(220),
+                                );
+                                if !exif_line.is_empty() {
+                                    painter.text(
+                                        Pos2::new(bot_rect.center().x, bot_rect.max.y - exif_h / 2.0),
+                                        egui::Align2::CENTER_CENTER, &exif_line,
+                                        egui::FontId::proportional(11.0), Color32::from_gray(190),
+                                    );
+                                }
+                            }
+                        }
                     }
 
                     // Column divider
@@ -2054,6 +2114,25 @@ fn apply_exif_orientation(img: DynamicImage, path: &Path) -> DynamicImage {
 /// folder with 5 000 files this is ~100× faster than the stat-based approach.
 /// Scan `dir` (non-recursive) for all supported image files, sorted by name.
 /// Uses `DirEntry::file_type()` to avoid an extra `stat()` per entry.
+/// Read all EXIF fields from `path`, skipping the thumbnail IFD.
+/// Returns an empty vec on any error so callers need no error handling.
+fn read_exif_rows(path: &Path) -> Vec<(String, String, String)> {
+    let Ok(file) = std::fs::File::open(path) else { return vec![] };
+    let Ok(exif) = ExifReader::new().read_from_container(&mut BufReader::new(file))
+        else { return vec![] };
+    let mut rows: Vec<(String, String, String)> = exif
+        .fields()
+        .filter(|f| f.ifd_num != In::THUMBNAIL)
+        .map(|f| (
+            format!("{}", f.ifd_num),
+            format!("{}", f.tag),
+            f.display_value().with_unit(&exif).to_string(),
+        ))
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    rows
+}
+
 fn scan_dir(dir: &Path) -> Vec<PathBuf> {
     let all_supported_formats: Vec<&str> = [
         &IMAGEREADER_SUPPORTED_FORMATS[..],
