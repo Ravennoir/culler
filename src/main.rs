@@ -31,6 +31,64 @@ mod windows;
 #[cfg(target_os = "windows")]
 use crate::windows::*;
 
+// ── Icon font ─────────────────────────────────────────────────────────────────
+// FontAwesome Free Solid is used when assets/fa-solid-900.ttf is present at
+// build time (see build.rs for the one-time download command).
+// When the font is missing the Unicode fallback glyphs below are used instead.
+
+/// Register FontAwesome Solid as a fallback in egui's proportional font family.
+/// Glyph look-up falls through to FA only for codepoints not covered by the
+/// default fonts (private-use area F000–F8FF), so regular text is unaffected.
+fn setup_icon_font(ctx: &egui::Context) {
+    #[cfg(has_fontawesome)]
+    {
+        static FA: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"), "/assets/fa-solid-900.ttf"
+        ));
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "fa-solid".to_owned(),
+            egui::FontData::from_static(FA),
+        );
+        fonts.families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .push("fa-solid".to_owned());
+        ctx.set_fonts(fonts);
+    }
+}
+
+// EXIF field icons — FA Solid codepoints (active when has_fontawesome is set)
+// with plain-Unicode fallbacks.  Both versions share the same tag list so the
+// two overlays (single-image and compare columns) are always in sync.
+
+#[cfg(has_fontawesome)]
+pub const EXIF_ICONS: &[(&str, &str)] = &[
+    ("ExposureTime",            "\u{f017} "), // fa-clock            shutter speed
+    ("FNumber",                 "\u{f192}/"), // fa-circle-dot       aperture
+    ("FocalLength",             "\u{f545} "), // fa-ruler            focal length
+    ("PhotographicSensitivity", "\u{f0e7} "), // fa-bolt             ISO
+    ("LensSpecification",       "\u{f030} "), // fa-camera           lens
+    ("ColorSpace",              ""),
+    ("WhiteBalance",            "\u{f0eb} "), // fa-lightbulb        white balance
+];
+
+#[cfg(not(has_fontawesome))]
+pub const EXIF_ICONS: &[(&str, &str)] = &[
+    ("ExposureTime",            "⊙ "),
+    ("FNumber",                 "ƒ/"),
+    ("FocalLength",             "↔ "),
+    ("PhotographicSensitivity", "▲ "),
+    ("LensSpecification",       "◎ "),
+    ("ColorSpace",              ""),
+    ("WhiteBalance",            "☀ "),
+];
+
+#[cfg(has_fontawesome)]
+const ICON_FILEPATH: &str = "\u{f07c}  "; // fa-folder-open
+#[cfg(not(has_fontawesome))]
+const ICON_FILEPATH: &str = "▸  ";
+
 // --- Constants ---
 const TILE_SIZE: usize = 1024; // Use tiles of 1024x1024 pixels for the detail view
 
@@ -138,6 +196,7 @@ struct ImageViewerApp {
 
 impl ImageViewerApp {
     fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>, initial_fullscreen: bool) -> Self {
+        setup_icon_font(&cc.egui_ctx);
         let (priority_tx, priority_rx) = mpsc::channel();
         // Capacity 8: allows up to 8 decoded background images to queue before
         // rayon threads block. Each embedded JPEG ColorImage ≈ 10 MB → ≤ 80 MB
@@ -1500,7 +1559,7 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                                 painter.rect_filled(bar_rect, 0.0, Color32::from_black_alpha(180));
                                 painter.text(
                                     bar_rect.center(), egui::Align2::CENTER_CENTER,
-                                    &format!("▸  {filename}"),
+                                    &format!("{ICON_FILEPATH}{filename}"),
                                     egui::FontId::proportional(13.0), Color32::from_gray(190),
                                 );
 
@@ -1510,15 +1569,8 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                                     .map(|i| if i <= rating { '★' } else { '☆' }).collect();
 
                                 self.ensure_exif_cached(order_pos);
-                                const EXIF_COLS: &[(&str, &str)] = &[
-                                    ("ExposureTime",           "⊙ "),
-                                    ("FNumber",                "ƒ/"),
-                                    ("FocalLength",            "↔ "),
-                                    ("PhotographicSensitivity","▲ "),
-                                    ("WhiteBalance",           "☀ "),
-                                ];
                                 let exif_line = if let Some(rows) = self.exif_cache.get(&order_pos) {
-                                    EXIF_COLS.iter()
+                                    EXIF_ICONS.iter()
                                         .filter_map(|&(tag, pfx)| {
                                             rows.iter()
                                                 .find(|(_, t, _)| t == tag)
@@ -1788,24 +1840,14 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                     egui::FontId::proportional(11.0), Color32::BLACK);
             }
 
-            // Rating + EXIF info overlay — shown in both single and compare mode
-            if self.show_info_overlay && !self.image_files.is_empty() {
+            // Rating + EXIF overlay and filepath bar — single-image mode only.
+            // Compare mode renders its own per-column overlays inside the column loop.
+            if self.show_info_overlay && !self.image_files.is_empty() && self.compare_set.len() <= 1 {
                 let current_path = &self.image_files[self.image_order[self.current_index]];
                 let rating = *self.ratings.get(current_path).unwrap_or(&0);
                 let stars: String = (1u8..=5).map(|i| if i <= rating { '★' } else { '☆' }).collect();
 
-                // Compact EXIF line — (tag, prefix glyph/icon)
-                // ⊙ shutter  ƒ/ aperture  ↔ focal-length  ◎ lens  ▲ ISO  ☀ white-balance
-                const EXIF_INFO_TAGS: &[(&str, &str)] = &[
-                    ("ExposureTime",           "⊙ "),
-                    ("FNumber",                "ƒ/"),
-                    ("FocalLength",            "↔ "),
-                    ("PhotographicSensitivity","▲ "),
-                    ("LensSpecification",      "◎ "),
-                    ("ColorSpace",             ""),
-                    ("WhiteBalance",           "☀ "),
-                ];
-                let exif_line = EXIF_INFO_TAGS.iter()
+                let exif_line = EXIF_ICONS.iter()
                     .filter_map(|&(tag, prefix)| {
                         self.exif_data.iter()
                             .find(|(_, t, _)| t == tag)
@@ -1814,38 +1856,27 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                     .collect::<Vec<_>>()
                     .join("  ·  ");
 
+                // Bottom: rating + EXIF
                 let stars_h = 48.0;
                 let exif_h  = if exif_line.is_empty() { 0.0 } else { 26.0 };
-                let overlay_height = stars_h + exif_h;
                 let overlay_rect = Rect::from_min_max(
-                    Pos2::new(available_rect.min.x, available_rect.max.y - overlay_height),
+                    Pos2::new(available_rect.min.x, available_rect.max.y - stars_h - exif_h),
                     available_rect.max,
                 );
                 ui.painter().rect_filled(overlay_rect, 0.0, Color32::from_black_alpha(180));
-
-                let stars_center = Pos2::new(
-                    overlay_rect.center().x,
-                    overlay_rect.min.y + stars_h / 2.0,
-                );
-                ui.painter().text(stars_center, egui::Align2::CENTER_CENTER,
+                ui.painter().text(
+                    Pos2::new(overlay_rect.center().x, overlay_rect.min.y + stars_h / 2.0),
+                    egui::Align2::CENTER_CENTER,
                     &stars, egui::FontId::proportional(28.0), Color32::from_gray(220));
-
                 if !exif_line.is_empty() {
-                    let exif_center = Pos2::new(
-                        overlay_rect.center().x,
-                        overlay_rect.max.y - exif_h / 2.0,
-                    );
-                    ui.painter().text(exif_center, egui::Align2::CENTER_CENTER,
+                    ui.painter().text(
+                        Pos2::new(overlay_rect.center().x, overlay_rect.max.y - exif_h / 2.0),
+                        egui::Align2::CENTER_CENTER,
                         &exif_line, egui::FontId::proportional(13.0), Color32::from_gray(190));
                 }
-            }
 
-            // Filepath bar — top of image, shown with info overlay
-            if self.show_info_overlay && !self.image_files.is_empty() {
-                let current_path = &self.image_files[self.image_order[self.current_index]];
+                // Top: filepath
                 let path_str = current_path.to_string_lossy();
-
-                // Sit below the culling HUD when both are active
                 let top_offset = if self.is_culling_mode { 34.0 } else { 0.0 };
                 let bar_h = 26.0;
                 let bar_rect = Rect::from_min_max(
@@ -1854,11 +1885,9 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                 );
                 ui.painter().rect_filled(bar_rect, 0.0, Color32::from_black_alpha(180));
                 ui.painter().text(
-                    bar_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    &format!("▸  {path_str}"),
-                    egui::FontId::proportional(13.0),
-                    Color32::from_gray(190),
+                    bar_rect.center(), egui::Align2::CENTER_CENTER,
+                    &format!("{ICON_FILEPATH}{path_str}"),
+                    egui::FontId::proportional(13.0), Color32::from_gray(190),
                 );
             }
 
