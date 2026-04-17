@@ -1611,11 +1611,31 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                             egui::Stroke::new(1.0, Color32::from_gray(50)),
                         );
                     }
-                    // Focus highlight
+                    // Focus indicator — small pill at the bottom of the focused column.
+                    // Sits above the info HUD strip when it is visible so it never overlaps.
                     if slot == self.compare_focus {
-                        ui.painter().rect_stroke(col_rect, 0.0,
-                            egui::Stroke::new(2.0, Color32::from_white_alpha(60)),
-                            egui::StrokeKind::Inside);
+                        // Compute how much space the info strip occupies at the bottom.
+                        let info_h = if self.show_info_overlay {
+                            let has_exif = self.exif_cache.get(&order_pos)
+                                .map(|rows| EXIF_ICONS.iter().any(|&(tag, pfx)|
+                                    !pfx.is_empty() && rows.iter().any(|(_, t, _)| t == tag)
+                                ))
+                                .unwrap_or(false);
+                            36.0 + if has_exif { 22.0 } else { 0.0 }
+                        } else {
+                            0.0
+                        };
+                        const PILL_W: f32 = 48.0;
+                        const PILL_H: f32 = 4.0;
+                        const GAP:   f32 = 6.0;
+                        let pill_rect = Rect::from_center_size(
+                            Pos2::new(
+                                col_rect.center().x,
+                                col_rect.max.y - info_h - GAP - PILL_H / 2.0,
+                            ),
+                            Vec2::new(PILL_W, PILL_H),
+                        );
+                        painter.rect_filled(pill_rect, PILL_H / 2.0, Color32::from_white_alpha(220));
                     }
                     // Reference image indicator — amber border + "REF" badge
                     if self.reference_image == Some(order_pos) {
