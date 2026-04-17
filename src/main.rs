@@ -1218,7 +1218,8 @@ impl ImageViewerApp {
         {
             self.show_help_overlay = !self.show_help_overlay;
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        let quit = ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Q));
+        if quit {
             if self.show_help_overlay {
                 self.show_help_overlay = false;
             } else {
@@ -1899,7 +1900,7 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                     ("0–5",                  "Set star rating  (info bar visible)"),
                     ("?",                    "EXIF side panel"),
                     ("H / F1",               "This help screen"),
-                    ("Escape",               "Close overlay / quit"),
+                    ("Escape / Q",           "Close overlay / quit"),
                     ("",                     ""),
                     ("Compare mode",         ""),
                     ("← / →",               "Move focus between images"),
