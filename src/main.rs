@@ -1548,9 +1548,15 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                     if self.show_info_overlay && !self.image_files.is_empty() {
                         if let Some(&file_idx) = self.image_order.get(order_pos) {
                             if let Some(path) = self.image_files.get(file_idx).cloned() {
-                                // Top: filename bar
-                                let filename = path.file_name()
+                                // Top: filepath bar — full path when it fits, filename otherwise
+                                let full_path   = path.to_string_lossy().into_owned();
+                                let filename    = path.file_name()
                                     .unwrap_or_default().to_string_lossy().into_owned();
+                                let font_id     = egui::FontId::proportional(13.0);
+                                let label_full  = format!("{ICON_FILEPATH}{full_path}");
+                                let label_short = format!("{ICON_FILEPATH}{filename}");
+                                let text_w = painter.layout_no_wrap(label_full.clone(), font_id.clone(), Color32::WHITE).size().x;
+                                let label = if text_w + 16.0 <= col_rect.width() { label_full } else { label_short };
                                 let bar_h = 26.0;
                                 let bar_rect = Rect::from_min_max(
                                     col_rect.min,
@@ -1559,8 +1565,7 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                                 painter.rect_filled(bar_rect, 0.0, Color32::from_black_alpha(180));
                                 painter.text(
                                     bar_rect.center(), egui::Align2::CENTER_CENTER,
-                                    &format!("{ICON_FILEPATH}{filename}"),
-                                    egui::FontId::proportional(13.0), Color32::from_gray(190),
+                                    &label, font_id, Color32::from_gray(190),
                                 );
 
                                 // Bottom: rating + compact EXIF
@@ -1900,8 +1905,14 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                         &exif_line, egui::FontId::proportional(13.0), Color32::from_gray(190));
                 }
 
-                // Top: filepath
-                let path_str = current_path.to_string_lossy();
+                // Top: filepath bar — full path when it fits, filename otherwise
+                let font_id     = egui::FontId::proportional(13.0);
+                let label_full  = format!("{ICON_FILEPATH}{}", current_path.to_string_lossy());
+                let label_short = format!("{ICON_FILEPATH}{}", current_path.file_name()
+                    .unwrap_or_default().to_string_lossy());
+                let bar_w  = available_rect.width();
+                let text_w = ui.painter().layout_no_wrap(label_full.clone(), font_id.clone(), Color32::WHITE).size().x;
+                let label = if text_w + 16.0 <= bar_w { label_full } else { label_short };
                 let top_offset = if self.is_culling_mode { 34.0 } else { 0.0 };
                 let bar_h = 26.0;
                 let bar_rect = Rect::from_min_max(
@@ -1911,8 +1922,7 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                 ui.painter().rect_filled(bar_rect, 0.0, Color32::from_black_alpha(180));
                 ui.painter().text(
                     bar_rect.center(), egui::Align2::CENTER_CENTER,
-                    &format!("{ICON_FILEPATH}{path_str}"),
-                    egui::FontId::proportional(13.0), Color32::from_gray(190),
+                    &label, font_id, Color32::from_gray(190),
                 );
             }
 
