@@ -2349,9 +2349,12 @@ fn downscale_color_image(image: ColorImage, max_size: usize) -> ColorImage {
 #[derive(clap::Parser, Debug)]
 #[command(name = "lightningview", version, about = "Fast image viewer")]
 struct Args {
-    /// Image file to open.
+    /// Image file(s) to open.  When the shell expands a glob (e.g. *.NEF) all
+    /// matches are accepted; only the first path is used to open the viewer —
+    /// the directory is scanned automatically for adjacent images.
     /// If omitted a native file-picker is shown (GUI mode).
-    path: Option<String>,
+    #[arg(trailing_var_arg = true)]
+    paths: Vec<String>,
 
     /// Open in a window instead of fullscreen.
     #[arg(long, short)]
@@ -2454,8 +2457,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     log::info!("LightningView {} starting", env!("CARGO_PKG_VERSION"));
 
-    let path = match args.path {
-        // ── CLI mode: path supplied as argument ───────────────────────────────
+    let path = match args.paths.into_iter().next() {
+        // ── CLI mode: one or more paths supplied (e.g. from glob expansion) ───
+        // Use the first path; the viewer scans the directory for adjacent files.
         Some(p) => get_absolute_path(&p)?,
 
         // ── GUI mode: no argument → show native file picker ───────────────────
