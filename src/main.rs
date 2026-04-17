@@ -113,9 +113,6 @@ struct DisplayableImage {
     /// True when this slot holds only a tiny thumbnail — a full-res preview is still loading.
     /// The full preview will replace this entry when it arrives.
     is_thumbnail: bool,
-    /// True when displaying an embedded JPEG preview extracted from a RAW container.
-    /// False for native images (JPEG, PNG, …) and for full sensor-resolution RAW decodes.
-    is_raw_preview: bool,
 }
 
 // Simplified enum for loaded image data before GPU upload
@@ -132,6 +129,15 @@ enum UndoAction {
     DropFromCompareSet { order_pos: usize, slot: usize },
     /// A star rating was changed (stores the rating that was in place before the change)
     SetRating { path: PathBuf, previous_stars: Option<u8> },
+}
+
+// --- RAW decode pipeline state ---
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RawDecodeStage {
+    MediumPending,
+    MediumDone,
+    HighPending,
+    HighDone,
 }
 
 // --- Main Application State ---
@@ -195,8 +201,8 @@ struct ImageViewerApp {
     cmd_listener: Option<UnixListener>,
     /// Ring buffer of recent decode times: (order_pos, path_stem, decode_ms).
     load_times: std::collections::VecDeque<(usize, String, u64)>,
-    /// order_pos values for which a full RAW decode has already been dispatched.
-    full_raw_requested: HashSet<usize>,
+    /// Two-stage RAW decode progress per order_pos.
+    raw_decode_stage: HashMap<usize, RawDecodeStage>,
 }
 
 impl ImageViewerApp {
@@ -253,7 +259,7 @@ impl ImageViewerApp {
                 })
             },
             load_times: std::collections::VecDeque::with_capacity(64),
-            full_raw_requested: HashSet::new(),
+            raw_decode_stage: HashMap::new(),
         };
         if let Some(path) = path {
             // scan_image_directory uses DirEntry::file_type() — no extra stat() per
@@ -391,26 +397,41 @@ impl ImageViewerApp {
         }
     }
 
-    /// Spawn a priority thread to decode the current image from raw sensor data at native
-    /// resolution, bypassing the embedded JPEG preview. Only fires for RAW files.
-    fn request_full_raw_decode(&mut self, ctx: &egui::Context) {
+    /// Alt+Enter: start medium-quality RAW decode (fast). High quality follows automatically.
+    fn request_raw_medium_decode(&mut self, ctx: &egui::Context) {
         let order_pos = self.current_index;
-        if self.full_raw_requested.contains(&order_pos) { return; }
+        if self.raw_decode_stage.contains_key(&order_pos) { return; }
         let Some(&file_idx) = self.image_order.get(order_pos) else { return };
         let Some(path) = self.image_files.get(file_idx).cloned() else { return };
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
         if !RAW_SUPPORTED_FORMATS.contains(&ext.as_str()) { return; }
-        self.full_raw_requested.insert(order_pos);
-        self.prefetch_pending.insert(order_pos); // keeps egui repainting until result arrives
+        self.raw_decode_stage.insert(order_pos, RawDecodeStage::MediumPending);
+        self.prefetch_pending.insert(order_pos);
         let tx = self.priority_tx.clone();
         std::thread::spawn(move || {
             let t = Instant::now();
-            match load_raw_full(&path) {
-                Ok(img) => {
-                    let color_image = to_egui_color_image(img); // imagepipe already applied orientation
-                    let _ = tx.send((order_pos, color_image, t.elapsed().as_millis() as u64));
-                }
-                Err(e) => log::error!("Full RAW decode failed: {e}"),
+            match load_raw_full(&path, RAW_MEDIUM_DIM) {
+                Ok(img) => { let _ = tx.send((order_pos, to_egui_color_image(img), t.elapsed().as_millis() as u64)); }
+                Err(e)  => log::error!("Medium RAW decode failed: {e}"),
+            }
+        });
+        ctx.request_repaint();
+    }
+
+    /// Spawn a high-quality RAW decode capped at the current viewport size.
+    fn request_raw_high_decode(&mut self, order_pos: usize, ctx: &egui::Context) {
+        if matches!(self.raw_decode_stage.get(&order_pos), Some(RawDecodeStage::HighPending | RawDecodeStage::HighDone)) { return; }
+        let Some(&file_idx) = self.image_order.get(order_pos) else { return };
+        let Some(path) = self.image_files.get(file_idx).cloned() else { return };
+        let maxdim = (self.last_view_size.x.max(self.last_view_size.y) as usize).clamp(RAW_MEDIUM_DIM, RAW_DECODE_MAX_DIM);
+        self.raw_decode_stage.insert(order_pos, RawDecodeStage::HighPending);
+        self.prefetch_pending.insert(order_pos);
+        let tx = self.priority_tx.clone();
+        std::thread::spawn(move || {
+            let t = Instant::now();
+            match load_raw_full(&path, maxdim) {
+                Ok(img) => { let _ = tx.send((order_pos, to_egui_color_image(img), t.elapsed().as_millis() as u64)); }
+                Err(e)  => log::error!("High RAW decode failed: {e}"),
             }
         });
         ctx.request_repaint();
@@ -455,7 +476,6 @@ impl ImageViewerApp {
             tile_cache: HashMap::new(),
             needs_tiling: false, // thumbnails are tiny, never need tiling
             is_thumbnail: true,
-            is_raw_preview: true, // thumbnail is always extracted from RAW
         });
     }
 
@@ -689,20 +709,31 @@ impl ImageViewerApp {
 
         // ── Priority channel: drain everything ──────────────────────────────
         let mut priority_drained = 0u32;
+        let mut needs_high_decode: Vec<usize> = Vec::new();
         while let Ok((pos, color_image, decode_ms)) = self.priority_rx.try_recv() {
             priority_drained += 1;
             self.prefetch_pending.remove(&pos);
             self.record_load_time(pos, decode_ms);
-            let is_full_raw = self.full_raw_requested.contains(&pos);
+            let is_raw_decode = self.raw_decode_stage.contains_key(&pos);
             let already_full = self.compare_images.get(&pos).map(|d| !d.is_thumbnail).unwrap_or(false);
-            if already_full && !is_full_raw { continue; }
-            let is_raw_preview = !is_full_raw && self.image_order.get(pos)
-                .and_then(|&fi| self.image_files.get(fi))
-                .and_then(|p| p.extension())
-                .and_then(|e| e.to_str())
-                .map(|e| RAW_SUPPORTED_FORMATS.contains(&e.to_lowercase().as_str()))
-                .unwrap_or(false);
-            any_new |= self.insert_decoded_image(pos, color_image, is_raw_preview, ctx);
+            if already_full && !is_raw_decode { continue; }
+            any_new |= self.insert_decoded_image(pos, color_image, ctx);
+            // Advance stage and queue next stage if needed
+            if let Some(stage) = self.raw_decode_stage.get(&pos).copied() {
+                match stage {
+                    RawDecodeStage::MediumPending => {
+                        self.raw_decode_stage.insert(pos, RawDecodeStage::MediumDone);
+                        needs_high_decode.push(pos);
+                    }
+                    RawDecodeStage::HighPending => {
+                        self.raw_decode_stage.insert(pos, RawDecodeStage::HighDone);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for pos in needs_high_decode {
+            self.request_raw_high_decode(pos, ctx);
         }
 
         // ── Background channel: at most 4 per frame ─────────────────────────
@@ -714,13 +745,7 @@ impl ImageViewerApp {
                     self.prefetch_pending.remove(&pos);
                     self.record_load_time(pos, decode_ms);
                     if self.compare_images.get(&pos).map(|d| !d.is_thumbnail).unwrap_or(false) { continue; }
-                    let is_raw_preview = self.image_order.get(pos)
-                        .and_then(|&fi| self.image_files.get(fi))
-                        .and_then(|p| p.extension())
-                        .and_then(|e| e.to_str())
-                        .map(|e| RAW_SUPPORTED_FORMATS.contains(&e.to_lowercase().as_str()))
-                        .unwrap_or(false);
-                    self.insert_decoded_image(pos, color_image, is_raw_preview, ctx);
+                    self.insert_decoded_image(pos, color_image, ctx);
                 }
                 Err(_) => break,
             }
@@ -754,7 +779,7 @@ impl ImageViewerApp {
 
     /// Insert a decoded ColorImage into compare_images and return true if it
     /// was the current image (triggers a scale-to-fit reset).
-    fn insert_decoded_image(&mut self, pos: usize, color_image: ColorImage, is_raw_preview: bool, ctx: &egui::Context) -> bool {
+    fn insert_decoded_image(&mut self, pos: usize, color_image: ColorImage, ctx: &egui::Context) -> bool {
         let Some(&file_idx) = self.image_order.get(pos) else { return false };
         let Some(path) = self.image_files.get(file_idx).cloned() else { return false };
         let max_texture_side = 2048;
@@ -776,7 +801,6 @@ impl ImageViewerApp {
             tile_cache: HashMap::new(),
             needs_tiling,
             is_thumbnail: false,
-            is_raw_preview,
         });
         log::debug!(
             "cache insert pos={} path={} size={}×{} mem={:.1}MB cache_count={}",
@@ -1332,7 +1356,7 @@ impl ImageViewerApp {
         // Alt+Enter (Option+Return on Mac): full sensor-resolution RAW decode.
         // Checked first so Cmd+Enter (which has !alt) still hits scale-to-fit below.
         if ctx.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.alt && !i.modifiers.command) {
-            self.request_full_raw_decode(ctx);
+            self.request_raw_medium_decode(ctx);
         } else if ctx.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.alt) {
             self.is_scaled_to_fit = !self.is_scaled_to_fit;
         }
@@ -1618,12 +1642,10 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                                     bar_rect.center(), egui::Align2::CENTER_CENTER,
                                     &label, font_id, Color32::from_gray(190),
                                 );
-                                let ext = path.extension().and_then(|e| e.to_str())
-                                    .map(|e| e.to_lowercase()).unwrap_or_default();
-                                let is_full_raw_decode = self.compare_images.get(&order_pos)
-                                    .map(|d| !d.is_raw_preview && !d.is_thumbnail)
-                                    .unwrap_or(false)
-                                    && RAW_SUPPORTED_FORMATS.contains(&ext.as_str());
+                                let is_full_raw_decode = matches!(
+                                    self.raw_decode_stage.get(&order_pos),
+                                    Some(RawDecodeStage::MediumDone | RawDecodeStage::HighDone)
+                                );
                                 if is_full_raw_decode {
                                     draw_raw_badge(&painter, col_rect);
                                 }
@@ -1708,7 +1730,7 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                         painter.rect_filled(pill_rect, PILL_H / 2.0, Color32::from_white_alpha(220));
                     }
                     // Full RAW decode in-progress spinner
-                    if self.full_raw_requested.contains(&order_pos)
+                    if matches!(self.raw_decode_stage.get(&order_pos), Some(RawDecodeStage::MediumPending | RawDecodeStage::HighPending))
                         && self.prefetch_pending.contains(&order_pos)
                     {
                         draw_raw_decoding_spinner(&painter, col_rect, &ctx);
@@ -1939,7 +1961,9 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
             // Full RAW decode in-progress spinner (single-image mode)
             if self.compare_set.len() <= 1 {
                 let pos = self.current_index;
-                if self.full_raw_requested.contains(&pos) && self.prefetch_pending.contains(&pos) {
+                if matches!(self.raw_decode_stage.get(&pos), Some(RawDecodeStage::MediumPending | RawDecodeStage::HighPending))
+                    && self.prefetch_pending.contains(&pos)
+                {
                     draw_raw_decoding_spinner(ui.painter(), available_rect, &ctx);
                 }
             }
@@ -1998,12 +2022,10 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                     bar_rect.center(), egui::Align2::CENTER_CENTER,
                     &label, font_id, Color32::from_gray(190),
                 );
-                let cur_ext = current_path.extension().and_then(|e| e.to_str())
-                    .map(|e| e.to_lowercase()).unwrap_or_default();
-                let is_full_raw_decode = self.compare_images.get(&self.current_index)
-                    .map(|d| !d.is_raw_preview && !d.is_thumbnail)
-                    .unwrap_or(false)
-                    && RAW_SUPPORTED_FORMATS.contains(&cur_ext.as_str());
+                let is_full_raw_decode = matches!(
+                    self.raw_decode_stage.get(&self.current_index),
+                    Some(RawDecodeStage::MediumDone | RawDecodeStage::HighDone)
+                );
                 if is_full_raw_decode {
                     draw_raw_badge(ui.painter(), available_rect);
                 }
@@ -2122,7 +2144,7 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                     ("Drag",                 "Pan image"),
                     ("Middle click",         "Reset zoom & pan"),
                     ("Enter",                "Scale to fit"),
-                    ("Alt+Enter",            "Decode full RAW at sensor resolution"),
+                    ("Alt+Enter",            "Decode RAW (medium → high quality)"),
                     ("F",                    "Toggle fullscreen"),
                     ("E",                    "Zoom to detected eye / next eye"),
                     ("Ctrl+C",               "Copy image to clipboard"),
@@ -2225,6 +2247,15 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                 }
             });
         }
+
+    // Zoom-triggered high quality: when user zooms in past 1.5× on a medium RAW, auto-upgrade.
+    {
+        let pos = self.current_index;
+        let zoom = if self.compare_set.len() > 1 { self.compare_zoom } else { self.zoom };
+        if zoom > 1.5 && matches!(self.raw_decode_stage.get(&pos), Some(RawDecodeStage::MediumDone)) {
+            self.request_raw_high_decode(pos, &ctx);
+        }
+    }
     }
 }
 
@@ -2567,11 +2598,13 @@ fn load_raw(path: &str) -> Result<DynamicImage, String> {
 ///   scale = 8256/4096 ≈ 2.02 ≥ 2.0  →  fast path, output ≈ 4096×2728 (10.7MP)
 /// That covers any 4K display. Raise MAX_DIM to 0 for true full-sensor output.
 const RAW_DECODE_MAX_DIM: usize = 4096;
+/// First-pass decode: fast scaled_demosaic (scale≥2 for most sensors), shows quickly.
+const RAW_MEDIUM_DIM: usize = 1920;
 
-fn load_raw_full(path: &Path) -> Result<DynamicImage, String> {
+fn load_raw_full(path: &Path, maxdim: usize) -> Result<DynamicImage, String> {
     let path_str = path.to_str().unwrap_or("");
-    log::debug!("Full RAW decode (capped at {}px) for {}", RAW_DECODE_MAX_DIM, path_str);
-    let decoded = imagepipe::simple_decode_8bit(path_str, RAW_DECODE_MAX_DIM, RAW_DECODE_MAX_DIM)
+    log::debug!("RAW decode (max {}px) for {}", maxdim, path_str);
+    let decoded = imagepipe::simple_decode_8bit(path_str, maxdim, maxdim)
         .map_err(|e| format!("Failed to decode RAW: {e}"))?;
     log::debug!("RAW decoded to {}×{}", decoded.width, decoded.height);
     image::RgbImage::from_raw(decoded.width as u32, decoded.height as u32, decoded.data)
