@@ -1778,6 +1778,28 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                 }
             }
 
+            // Filepath bar — top of image, shown with info overlay
+            if self.show_info_overlay && !self.image_files.is_empty() {
+                let current_path = &self.image_files[self.image_order[self.current_index]];
+                let path_str = current_path.to_string_lossy();
+
+                // Sit below the culling HUD when both are active
+                let top_offset = if self.is_culling_mode { 34.0 } else { 0.0 };
+                let bar_h = 26.0;
+                let bar_rect = Rect::from_min_max(
+                    Pos2::new(available_rect.min.x, available_rect.min.y + top_offset),
+                    Pos2::new(available_rect.max.x, available_rect.min.y + top_offset + bar_h),
+                );
+                ui.painter().rect_filled(bar_rect, 0.0, Color32::from_black_alpha(180));
+                ui.painter().text(
+                    bar_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    path_str.as_ref(),
+                    egui::FontId::proportional(13.0),
+                    Color32::from_gray(190),
+                );
+            }
+
             // Culling mode HUD — top bar
             if self.is_culling_mode {
                 let hud_height = 34.0;
