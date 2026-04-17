@@ -25,6 +25,8 @@ rayon = "1.11.0"
 jxl-oxide = { version = "0.12", features = ["image"] }
 kamadak-exif = "0.5"
 memmap2 = "0.9"
+clap = { version = "4", features = ["derive"] }
+rfd = "0.15"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = ["Win32_UI_Shell"]}
@@ -53,6 +55,8 @@ codegen-units = 1
 [package.metadata.bundle]
 name = "LightningView"
 identifier = "com.lightningview"
+# executable name must match the binary name (used in Info.plist CFBundleExecutable)
+osx_minimum_system_version = "11.0"
 version = "2.4.5"
 license = "GPLv2"
 icon = ["logo_256.png"]
@@ -60,6 +64,21 @@ copyright = "2025-2026, the LightningView developers"
 category = "Graphics and Design"
 short_description = "A fast image viewer"
 long_description = "LightningView is a fast image viewer that supports a wide range of image formats. It is designed to be fast and responsive, with a minimal interface that gets out of your way. LightningView is perfect for quickly viewing and sorting through large collections of images."
+# macOS: declare the document types the app can open.
+# When the user drags a file onto LightningView.app in Finder, macOS passes
+# the path as a command-line argument, triggering CLI mode in main().
+osx_document_types = [
+    { name = "Image", role = "Viewer", rank = "Default",
+      mime_types = ["image/jpeg", "image/png", "image/tiff", "image/webp",
+                    "image/gif", "image/bmp", "image/x-nikon-nef",
+                    "image/x-canon-cr2", "image/x-adobe-dng",
+                    "image/x-sony-arw", "image/x-fuji-raf",
+                    "image/jxl", "application/fits"],
+      extensions = ["jpg", "jpeg", "png", "tiff", "tif", "webp", "gif",
+                    "bmp", "nef", "cr2", "dng", "arw", "raf", "rw2",
+                    "orf", "pef", "srw", "jxl", "fits", "fit"] },
+]
+
 linux_exec_args = "%f"
 linux_mime_types = [
     "image/jpeg",

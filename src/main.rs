@@ -2344,17 +2344,90 @@ fn downscale_color_image(image: ColorImage, max_size: usize) -> ColorImage {
 }
 
 // --- Main Entry Point ---
+// ── Entry-point argument schema ───────────────────────────────────────────────
+
+#[derive(clap::Parser, Debug)]
+#[command(name = "lightningview", version, about = "Fast image viewer")]
+struct Args {
+    /// Image file to open.
+    /// If omitted a native file-picker is shown (GUI mode).
+    path: Option<String>,
+
+    /// Open in a window instead of fullscreen.
+    #[arg(long, short)]
+    windowed: bool,
+
+    /// Send a command to a running LightningView instance and print the reply.
+    /// Example: `lightningview --cmd status`
+    #[cfg(unix)]
+    #[arg(long, value_name = "COMMAND")]
+    cmd: Option<String>,
+
+    /// [Windows] Register as the default image viewer in the system registry.
+    #[cfg(target_os = "windows")]
+    #[arg(long, hide = true)]
+    register: bool,
+
+    /// [Windows] Remove the image viewer registration from the system registry.
+    #[cfg(target_os = "windows")]
+    #[arg(long, hide = true)]
+    unregister: bool,
+}
+
+// ── Core viewer launcher — shared by CLI and GUI modes ────────────────────────
+
+/// Open the image viewer at `path`.  This is the single function called
+/// regardless of how the path was obtained (CLI argument or GUI file-picker).
+fn run_viewer(path: PathBuf, fullscreen: bool) -> Result<(), eframe::Error> {
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 720.0])
+            .with_min_inner_size([300.0, 200.0])
+            .with_app_id("lightningview"),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Lightning View",
+        native_options,
+        Box::new(move |cc| Ok(Box::new(ImageViewerApp::new(cc, Some(path), fullscreen)))),
+    )
+}
+
+// ── GUI helper — native file picker ──────────────────────────────────────────
+
+/// Show a native file-open dialog and return the selected path, or `None`
+/// when the user cancels.  Only called in GUI (no-argument) mode.
+fn pick_image_file() -> Option<PathBuf> {
+    let all_exts: Vec<&str> = [
+        &IMAGEREADER_SUPPORTED_FORMATS[..],
+        &ANIM_SUPPORTED_FORMATS[..],
+        &IMAGE_RS_SUPPORTED_FORMATS[..],
+        &RAW_SUPPORTED_FORMATS[..],
+        &FITS_SUPPORTED_FORMATS[..],
+        &JXL_SUPPORTED_FORMATS[..],
+    ]
+    .concat();
+
+    rfd::FileDialog::new()
+        .set_title("Open Image — LightningView")
+        .add_filter("Images", &all_exts)
+        .pick_file()
+}
+
+// ── Main entry point ──────────────────────────────────────────────────────────
+
 fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
-    let args: Vec<String> = env::args().collect();
 
-    // ── CLI client mode: send a command to the running instance ──────────────
+    use clap::Parser as _;
+    let args = Args::parse();
+
+    // ── Unix socket client (relay command to running instance) ────────────────
     #[cfg(unix)]
-    if args.get(1).map(|s| s.as_str()) == Some("--cmd") {
+    if let Some(cmd) = args.cmd {
         use std::os::unix::net::UnixStream;
-        let cmd = args.get(2).map(|s| s.as_str()).unwrap_or("help");
         let mut stream = UnixStream::connect("/tmp/lightningview.sock")
-            .map_err(|e| format!("Cannot connect to running LightningView instance: {e}\n(is LightningView running?)"))?;
+            .map_err(|e| format!("Cannot connect to running LightningView: {e}"))?;
         writeln!(stream, "{}", cmd)?;
         stream.shutdown(std::net::Shutdown::Write)?;
         let mut response = String::new();
@@ -2363,61 +2436,32 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    log::info!("LightningView {} starting", env!("CARGO_PKG_VERSION"));
-    if args.len() < 2 {
-        println!("Usage: {} [/windowed] <imagefile>", args[0]);
-        println!("       {} --cmd <command>   (send command to running instance)", args[0]);
-        return Ok(());
-    }
-    
-    let mut is_fullscreen = true;
-    let mut image_file_arg = &args[1];
-
-    if args[1].eq_ignore_ascii_case("/windowed") {
-        if args.len() > 2 {
-            is_fullscreen = false;
-            image_file_arg = &args[2];
-        } else {
-            println!("Missing image file after /windowed");
-            return Ok(());
-        }
-    }
-
+    // ── Windows registry helpers ──────────────────────────────────────────────
     #[cfg(target_os = "windows")]
     {
-        if image_file_arg.eq_ignore_ascii_case("/register") {
+        if args.register {
             return match register_urlhandler() {
-                Ok(_) => {
-                    println!("Success! Registered as image viewer.");
-                    Ok(())
-                }
-                Err(err) => {
-                    println!("Failed to register: {}", err);
-                    Ok(())
-                }
+                Ok(_)    => { println!("Registered as image viewer."); Ok(()) }
+                Err(e)   => { println!("Registration failed: {e}");   Ok(()) }
             };
-        } else if image_file_arg.eq_ignore_ascii_case("/unregister") {
+        }
+        if args.unregister {
             unregister_urlhandler();
             println!("Unregistered as image viewer.");
             return Ok(());
         }
     }
 
-    let initial_path = get_absolute_path(image_file_arg)?;
+    log::info!("LightningView {} starting", env!("CARGO_PKG_VERSION"));
 
-    let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 720.0])
-            .with_min_inner_size([300.0, 200.0])
-	    .with_app_id("lightningview"),
-        ..Default::default()
+    let path = match args.path {
+        // ── CLI mode: path supplied as argument ───────────────────────────────
+        Some(p) => get_absolute_path(&p)?,
+
+        // ── GUI mode: no argument → show native file picker ───────────────────
+        None => pick_image_file().ok_or("No file selected.")?,
     };
 
-    eframe::run_native(
-        "Lightning View (egui)",
-        native_options,
-        Box::new(|cc| Ok(Box::new(ImageViewerApp::new(cc, Some(initial_path), is_fullscreen)))),
-    )?;
-
+    run_viewer(path, !args.windowed)?;
     Ok(())
 }
