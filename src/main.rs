@@ -1708,6 +1708,12 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                         );
                         painter.rect_filled(pill_rect, PILL_H / 2.0, Color32::from_white_alpha(220));
                     }
+                    // Full RAW decode in-progress spinner
+                    if self.full_raw_requested.contains(&order_pos)
+                        && self.prefetch_pending.contains(&order_pos)
+                    {
+                        draw_raw_decoding_spinner(&painter, col_rect, &ctx);
+                    }
                     // Reference image indicator — amber border + "REF" badge
                     if self.reference_image == Some(order_pos) {
                         ui.painter().rect_stroke(col_rect, 0.0,
@@ -1929,6 +1935,14 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                 ui.painter().rect_filled(badge_rect, 3.0, Color32::from_rgb(255, 180, 0));
                 ui.painter().text(badge_rect.center(), egui::Align2::CENTER_CENTER, "REF",
                     egui::FontId::proportional(11.0), Color32::BLACK);
+            }
+
+            // Full RAW decode in-progress spinner (single-image mode)
+            if self.compare_set.len() <= 1 {
+                let pos = self.current_index;
+                if self.full_raw_requested.contains(&pos) && self.prefetch_pending.contains(&pos) {
+                    draw_raw_decoding_spinner(ui.painter(), available_rect, &ctx);
+                }
             }
 
             // Rating + EXIF overlay and filepath bar — single-image mode only.
@@ -2372,6 +2386,25 @@ fn load_animated_gif_frames(path: &str) -> Result<Vec<(ColorImage, Duration)>, S
             (color_image, delay)
         })
         .collect())
+}
+
+/// Animated "Decoding RAW…" indicator centred on the image while imagepipe runs.
+fn draw_raw_decoding_spinner(painter: &egui::Painter, image_rect: Rect, ctx: &egui::Context) {
+    let dots = match (ctx.input(|i| i.time) * 2.0) as usize % 4 {
+        0 => "",
+        1 => ".",
+        2 => "..",
+        _ => "...",
+    };
+    let text = format!("Decoding RAW{dots}");
+    let font  = egui::FontId::monospace(13.0);
+    let center = image_rect.center();
+    let pad   = Vec2::new(14.0, 7.0);
+    let text_size = painter.layout_no_wrap(text.clone(), font.clone(), Color32::WHITE).size();
+    let bg = Rect::from_center_size(center, text_size + pad * 2.0);
+    painter.rect_filled(bg, 4.0, Color32::from_black_alpha(160));
+    painter.text(center, egui::Align2::CENTER_CENTER, &text, font, Color32::from_gray(210));
+    ctx.request_repaint();
 }
 
 /// Gray monofont "[RAW]" label at the top-right of the image area, shown after
