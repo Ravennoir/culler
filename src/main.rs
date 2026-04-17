@@ -91,6 +91,8 @@ const ICON_FILEPATH: &str = "▸  ";
 
 // --- Constants ---
 const TILE_SIZE: usize = 1024; // Use tiles of 1024x1024 pixels for the detail view
+/// Images wider or taller than this need tiling; preview texture is downscaled to this.
+const MAX_TEXTURE_SIDE: usize = 2048;
 
 // --- Supported Formats ---
 pub const IMAGEREADER_SUPPORTED_FORMATS: [&str; 4] = ["webp", "tif", "tiff", "tga"];
@@ -151,10 +153,12 @@ struct ImageViewerApp {
     // priority_tx  : unbounded; at most ~13 items in flight (next/prev 10 + compare set).
     // background_tx: bounded sync_channel; rayon threads block when full, capping
     //                the number of decoded ColorImages queued in memory at any time.
-    priority_tx:   mpsc::Sender<(usize, ColorImage, u64)>,
-    priority_rx:   mpsc::Receiver<(usize, ColorImage, u64)>,
-    background_tx: mpsc::SyncSender<(usize, ColorImage, u64)>,
-    background_rx: mpsc::Receiver<(usize, ColorImage, u64)>,
+    // Each message is (order_pos, full_res, preview, decode_ms). The preview is
+    // pre-downscaled in the background thread so the UI thread never calls resize().
+    priority_tx:   mpsc::Sender<(usize, ColorImage, ColorImage, u64)>,
+    priority_rx:   mpsc::Receiver<(usize, ColorImage, ColorImage, u64)>,
+    background_tx: mpsc::SyncSender<(usize, ColorImage, ColorImage, u64)>,
+    background_rx: mpsc::Receiver<(usize, ColorImage, ColorImage, u64)>,
     /// Failed loads send their order_pos here so poll_prefetch can clear prefetch_pending.
     load_fail_tx:  mpsc::Sender<usize>,
     load_fail_rx:  mpsc::Receiver<usize>,
@@ -417,7 +421,7 @@ impl ImageViewerApp {
         std::thread::spawn(move || {
             let t = Instant::now();
             match load_raw_full(&path, RAW_MEDIUM_DIM) {
-                Ok(img) => { let _ = tx.send((order_pos, to_egui_color_image(img), t.elapsed().as_millis() as u64)); }
+                Ok(img) => { let (full, preview) = prepare_decoded(to_egui_color_image(img)); let _ = tx.send((order_pos, full, preview, t.elapsed().as_millis() as u64)); }
                 Err(e)  => log::error!("Medium RAW decode failed: {e}"),
             }
         });
@@ -436,7 +440,7 @@ impl ImageViewerApp {
         std::thread::spawn(move || {
             let t = Instant::now();
             match load_raw_full(&path, maxdim) {
-                Ok(img) => { let _ = tx.send((order_pos, to_egui_color_image(img), t.elapsed().as_millis() as u64)); }
+                Ok(img) => { let (full, preview) = prepare_decoded(to_egui_color_image(img)); let _ = tx.send((order_pos, full, preview, t.elapsed().as_millis() as u64)); }
                 Err(e)  => log::error!("High RAW decode failed: {e}"),
             }
         });
@@ -684,7 +688,8 @@ impl ImageViewerApp {
                         Ok(LoadedImage::Static(img)) => {
                             let ms = t.elapsed().as_millis() as u64;
                             log::debug!("thread[{}]: decoded {}×{} in {}ms", pos, img.width(), img.height(), ms);
-                            let _ = tx.send((pos, img, ms));
+                            let (full, preview) = prepare_decoded(img);
+                            let _ = tx.send((pos, full, preview, ms));
                         }
                         Err(e) => { log::warn!("thread[{}]: load FAILED: {}", pos, e); let _ = fail.send(pos); }
                     }
@@ -698,7 +703,8 @@ impl ImageViewerApp {
                         Ok(LoadedImage::Static(img)) => {
                             let ms = t.elapsed().as_millis() as u64;
                             log::debug!("bg_thread[{}]: decoded {}×{} in {}ms", pos, img.width(), img.height(), ms);
-                            let _ = tx.send((pos, img, ms));
+                            let (full, preview) = prepare_decoded(img);
+                            let _ = tx.send((pos, full, preview, ms));
                         }
                         Err(e) => { log::warn!("bg_thread[{}]: load FAILED: {}", pos, e); let _ = fail.send(pos); }
                     }
@@ -718,14 +724,14 @@ impl ImageViewerApp {
         // ── Priority channel: drain everything ──────────────────────────────
         let mut priority_drained = 0u32;
         let mut needs_high_decode: Vec<usize> = Vec::new();
-        while let Ok((pos, color_image, decode_ms)) = self.priority_rx.try_recv() {
+        while let Ok((pos, full_res, preview, decode_ms)) = self.priority_rx.try_recv() {
             priority_drained += 1;
             self.prefetch_pending.remove(&pos);
             self.record_load_time(pos, decode_ms);
             let is_raw_decode = self.raw_decode_stage.contains_key(&pos);
             let already_full = self.compare_images.get(&pos).map(|d| !d.is_thumbnail).unwrap_or(false);
             if already_full && !is_raw_decode { continue; }
-            any_new |= self.insert_decoded_image(pos, color_image, ctx);
+            any_new |= self.insert_decoded_image(pos, full_res, preview, ctx);
             // Advance stage and queue next stage if needed
             if let Some(stage) = self.raw_decode_stage.get(&pos).copied() {
                 match stage {
@@ -748,12 +754,12 @@ impl ImageViewerApp {
         let mut bg_processed = 0u32;
         while bg_processed < 4 {
             match self.background_rx.try_recv() {
-                Ok((pos, color_image, decode_ms)) => {
+                Ok((pos, full_res, preview, decode_ms)) => {
                     bg_processed += 1;
                     self.prefetch_pending.remove(&pos);
                     self.record_load_time(pos, decode_ms);
                     if self.compare_images.get(&pos).map(|d| !d.is_thumbnail).unwrap_or(false) { continue; }
-                    self.insert_decoded_image(pos, color_image, ctx);
+                    self.insert_decoded_image(pos, full_res, preview, ctx);
                 }
                 Err(_) => break,
             }
@@ -791,26 +797,20 @@ impl ImageViewerApp {
         }
     }
 
-    /// Insert a decoded ColorImage into compare_images and return true if it
-    /// was the current image (triggers a scale-to-fit reset).
-    fn insert_decoded_image(&mut self, pos: usize, color_image: ColorImage, ctx: &egui::Context) -> bool {
+    /// Insert a pre-decoded image pair into compare_images.
+    /// `preview` is already downscaled (computed in the background thread).
+    fn insert_decoded_image(&mut self, pos: usize, full_res: ColorImage, preview: ColorImage, ctx: &egui::Context) -> bool {
         let Some(&file_idx) = self.image_order.get(pos) else { return false };
         let Some(path) = self.image_files.get(file_idx).cloned() else { return false };
-        let max_texture_side = 2048;
-        let needs_tiling = color_image.width() > max_texture_side || color_image.height() > max_texture_side;
-        let preview_image = if needs_tiling {
-            downscale_color_image(color_image.clone(), max_texture_side)
-        } else {
-            color_image.clone()
-        };
+        let needs_tiling = full_res.width() > MAX_TEXTURE_SIDE || full_res.height() > MAX_TEXTURE_SIDE;
         let preview_texture = ctx.load_texture(
             format!("{}_preview", path.display()),
-            preview_image,
+            preview,
             Default::default(),
         );
-        let bytes = color_image.width() * color_image.height() * 4;
+        let bytes = full_res.width() * full_res.height() * 4;
         self.compare_images.insert(pos, DisplayableImage {
-            full_res_image: color_image,
+            full_res_image: full_res,
             preview_texture,
             tile_cache: HashMap::new(),
             needs_tiling,
@@ -2723,15 +2723,25 @@ fn get_absolute_path(filename: &str) -> Result<PathBuf, String> {
 
 fn downscale_color_image(image: ColorImage, max_size: usize) -> ColorImage {
     let size = image.size;
-    let rgba_image = image::RgbaImage::from_raw(size[0] as u32, size[1] as u32, image.pixels.iter().flat_map(|c| c.to_array()).collect()).unwrap();
-    let (width, height) = (rgba_image.width(), rgba_image.height());
-    let new_dims = if width > max_size as u32 || height > max_size as u32 {
-        let aspect_ratio = width as f32 / height as f32;
-        if width > height { (max_size as u32, (max_size as f32 / aspect_ratio) as u32) } 
-        else { ((max_size as f32 * aspect_ratio) as u32, max_size as u32) }
-    } else { (width, height) };
-    let resized_img = imageops::resize(&rgba_image, new_dims.0, new_dims.1, imageops::FilterType::Lanczos3);
-    ColorImage::from_rgba_unmultiplied([resized_img.width() as _, resized_img.height() as _], resized_img.as_raw())
+    let rgba_image = image::RgbaImage::from_raw(
+        size[0] as u32, size[1] as u32,
+        image.pixels.iter().flat_map(|c| c.to_array()).collect(),
+    ).unwrap();
+    // Triangle (bilinear) is fast and good enough for a preview texture.
+    let resized = imageops::thumbnail(&rgba_image, max_size as u32, max_size as u32);
+    ColorImage::from_rgba_unmultiplied([resized.width() as _, resized.height() as _], resized.as_raw())
+}
+
+/// Build (full_res, preview) in the background thread so the UI thread never
+/// calls a slow resize. preview == full_res when the image fits in MAX_TEXTURE_SIDE.
+fn prepare_decoded(img: ColorImage) -> (ColorImage, ColorImage) {
+    let needs_downscale = img.width() > MAX_TEXTURE_SIDE || img.height() > MAX_TEXTURE_SIDE;
+    if needs_downscale {
+        let preview = downscale_color_image(img.clone(), MAX_TEXTURE_SIDE);
+        (img, preview)
+    } else {
+        (img.clone(), img)
+    }
 }
 
 // --- Main Entry Point ---
