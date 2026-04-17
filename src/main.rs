@@ -2560,12 +2560,20 @@ fn load_raw(path: &str) -> Result<DynamicImage, String> {
 
 /// Full RAW decode via imagepipe — bypasses embedded JPEG previews entirely.
 /// imagepipe applies EXIF orientation internally, so no extra rotation is needed.
-/// maxwidth/maxheight = 0 means native sensor resolution (slowest, highest quality).
+///
+/// MAX_DIM caps the demosaic output. When sensor_width/MAX_DIM >= 2.0, imagepipe
+/// switches to `scaled_demosaic` — a single-pass combined demosaic+downscale that is
+/// ~4x faster than full demosaic + separate scale. For a 45MP Z7 II (8256px wide):
+///   scale = 8256/4096 ≈ 2.02 ≥ 2.0  →  fast path, output ≈ 4096×2728 (10.7MP)
+/// That covers any 4K display. Raise MAX_DIM to 0 for true full-sensor output.
+const RAW_DECODE_MAX_DIM: usize = 4096;
+
 fn load_raw_full(path: &Path) -> Result<DynamicImage, String> {
     let path_str = path.to_str().unwrap_or("");
-    log::debug!("Full RAW decode (sensor res) for {}", path_str);
-    let decoded = imagepipe::simple_decode_8bit(path_str, 0, 0)
+    log::debug!("Full RAW decode (capped at {}px) for {}", RAW_DECODE_MAX_DIM, path_str);
+    let decoded = imagepipe::simple_decode_8bit(path_str, RAW_DECODE_MAX_DIM, RAW_DECODE_MAX_DIM)
         .map_err(|e| format!("Failed to decode RAW: {e}"))?;
+    log::debug!("RAW decoded to {}×{}", decoded.width, decoded.height);
     image::RgbImage::from_raw(decoded.width as u32, decoded.height as u32, decoded.data)
         .map(DynamicImage::ImageRgb8)
         .ok_or_else(|| "Failed to create image from RAW data".to_string())
