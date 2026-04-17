@@ -1507,6 +1507,13 @@ impl eframe::App for ImageViewerApp {
     /// Called before every `ui` call, and also when the window is hidden but
     /// `request_repaint` fired (eframe 0.34 API).  Non-UI background work goes here.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Heartbeat: while the CLI socket is bound keep logic() firing at ~20 fps
+        // even when the app is otherwise idle.  Without this, eframe stops
+        // repainting after all prefetch finishes and socket commands sit unprocessed.
+        #[cfg(unix)]
+        if self.cmd_listener.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
         self.poll_commands(ctx);
         self.poll_prefetch(ctx);
         self.poll_eye_detection(ctx);

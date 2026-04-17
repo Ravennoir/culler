@@ -141,14 +141,19 @@ fn cached_model_bytes() -> Option<&'static Vec<u8>> {
 
 // ── step 2: background thread ─────────────────────────────────────────────────
 
-/// Run face detection on a pre-scaled grayscale buffer and return estimated
-/// eye positions in **full-resolution** image coordinates.
+/// Run face detection on the downscaled grayscale buffer, then localise each
+/// eye precisely by searching for the darkest compact region (iris/pupil) inside
+/// the upper half of each detected face bounding box.
 ///
-/// `scale_inv` is the reciprocal of the scale that was used to produce `gray`
-/// (returned by `prepare_gray`).
+/// Coordinate pipeline:
+///   1. Rustface operates in the small (640 px) buffer — face bbox in small coords.
+///   2. `find_darkest_patch` searches the same small buffer for the actual iris.
+///   3. All small-buffer positions are multiplied by `scale_inv` to produce
+///      coordinates in the full-resolution display image.
 ///
-/// The face model is read from disk once and cached; subsequent calls parse
-/// from RAM.  Must still run on a background thread (cascade detection is slow).
+/// This avoids the fixed-percentage heuristic (which was frequently off by
+/// hundreds of pixels at the display resolution) and instead reads the actual
+/// pixel values to locate each eye.
 pub fn detect_from_gray(gray: Vec<u8>, w: u32, h: u32, scale_inv: f32) -> Vec<Pos2> {
     let model_bytes = match cached_model_bytes() {
         Some(b) => b,
@@ -171,9 +176,6 @@ pub fn detect_from_gray(gray: Vec<u8>, w: u32, h: u32, scale_inv: f32) -> Vec<Po
     };
 
     let mut detector = rustface::create_detector_with_model(model);
-    // min_face_size of 40 on a 640 px image ≈ face 6 % of frame width — catches
-    // subjects from close-up portraits to full-body shots. Detection runs on a
-    // background thread so pyramid depth (~6 levels) is not a concern.
     detector.set_min_face_size(40);
     detector.set_score_thresh(2.0);
     detector.set_pyramid_scale_factor(0.8);
@@ -185,17 +187,69 @@ pub fn detect_from_gray(gray: Vec<u8>, w: u32, h: u32, scale_inv: f32) -> Vec<Po
     let mut eyes = Vec::with_capacity(faces.len() * 2);
     for face in &faces {
         let b = face.bbox();
-        let fx = b.x() as f32 * scale_inv;
-        let fy = b.y() as f32 * scale_inv;
-        let fw = b.width() as f32 * scale_inv;
-        let fh = b.height() as f32 * scale_inv;
-        // Left eye: ~30 % from left, ~37 % from top of bounding box
-        eyes.push(Pos2::new(fx + fw * 0.30, fy + fh * 0.37));
-        // Right eye: ~70 % from left, ~37 % from top of bounding box
-        eyes.push(Pos2::new(fx + fw * 0.70, fy + fh * 0.37));
+        // All coordinates in the small (640 px) buffer until the final scale.
+        let bx = b.x().max(0) as u32;
+        let by = b.y().max(0) as u32;
+        let bw = b.width() as u32;
+        let bh = b.height() as u32;
+
+        // Search region: upper 55 % of the face bbox (eyes are never in the
+        // lower half). Skip the top 10 % to avoid forehead padding artifacts.
+        let y0 = by + bh / 10;
+        let y1 = (by + bh * 55 / 100).min(h);
+        let mid = bx + bw / 2;
+
+        let left  = find_darkest_patch(&gray, w, bx,  y0, mid,        y1);
+        let right = find_darkest_patch(&gray, w, mid, y0, (bx + bw).min(w), y1);
+
+        // Scale from detection space → display space.
+        eyes.push(Pos2::new(left.0  as f32 * scale_inv, left.1  as f32 * scale_inv));
+        eyes.push(Pos2::new(right.0 as f32 * scale_inv, right.1 as f32 * scale_inv));
     }
     log::info!("Eye detection: found {} face(s), {} eye position(s)", faces.len(), eyes.len());
     eyes
+}
+
+/// Find the (x, y) of the darkest 7×7 patch inside the rectangle
+/// [x0, x1) × [y0, y1) of the grayscale buffer.
+///
+/// A 7×7 window average suppresses single-pixel noise (specular highlights,
+/// JPEG artefacts) while remaining sensitive enough to locate the iris, whose
+/// radius is typically 4–10 pixels at 640 px scale.
+///
+/// Complexity: O((x1-x0) × (y1-y0)) — for a typical 100×60 px eye search
+/// region this is < 10 000 operations.
+fn find_darkest_patch(gray: &[u8], stride: u32, x0: u32, y0: u32, x1: u32, y1: u32) -> (u32, u32) {
+    const R: u32 = 3; // half-window; 7×7 total
+    let cx_fallback = (x0 + x1) / 2;
+    let cy_fallback = (y0 + y1) / 2;
+
+    if x1 <= x0 + 2 * R || y1 <= y0 + 2 * R {
+        return (cx_fallback, cy_fallback);
+    }
+
+    let mut best: u64 = u64::MAX;
+    let mut best_x = cx_fallback;
+    let mut best_y = cy_fallback;
+
+    for cy in (y0 + R)..(y1 - R) {
+        for cx in (x0 + R)..(x1 - R) {
+            let mut sum: u64 = 0;
+            for dy in 0..(2 * R + 1) {
+                let row = ((cy + dy - R) * stride) as usize;
+                for dx in 0..(2 * R + 1) {
+                    let col = (cx + dx - R) as usize;
+                    sum += gray[row + col] as u64;
+                }
+            }
+            if sum < best {
+                best = sum;
+                best_x = cx;
+                best_y = cy;
+            }
+        }
+    }
+    (best_x, best_y)
 }
 
 /// Load the face-detection model into the in-memory cache without running any
