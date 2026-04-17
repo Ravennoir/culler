@@ -2028,9 +2028,9 @@ fn apply_exif_orientation(img: DynamicImage, path: &Path) -> DynamicImage {
 /// Uses `DirEntry::file_type()` (which reads the type from `readdir` without an
 /// extra `stat()` syscall on macOS/Linux) instead of `Path::is_file()`.  On a
 /// folder with 5 000 files this is ~100× faster than the stat-based approach.
-fn scan_image_directory(file_path: &Path) -> Vec<PathBuf> {
-    let Some(parent_dir) = file_path.parent() else { return vec![file_path.to_path_buf()] };
-
+/// Scan `dir` (non-recursive) for all supported image files, sorted by name.
+/// Uses `DirEntry::file_type()` to avoid an extra `stat()` per entry.
+fn scan_dir(dir: &Path) -> Vec<PathBuf> {
     let all_supported_formats: Vec<&str> = [
         &IMAGEREADER_SUPPORTED_FORMATS[..],
         &ANIM_SUPPORTED_FORMATS[..],
@@ -2041,12 +2041,11 @@ fn scan_image_directory(file_path: &Path) -> Vec<PathBuf> {
     ]
     .concat();
 
-    let Ok(entries) = fs::read_dir(parent_dir) else { return vec![file_path.to_path_buf()] };
+    let Ok(entries) = fs::read_dir(dir) else { return vec![] };
 
     let mut files: Vec<PathBuf> = entries
         .filter_map(|entry| {
             let entry = entry.ok()?;
-            // file_type() uses the type from readdir — no extra stat() syscall.
             if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) { return None; }
             let path = entry.path();
             let path_str = path.to_string_lossy().to_lowercase();
@@ -2060,6 +2059,18 @@ fn scan_image_directory(file_path: &Path) -> Vec<PathBuf> {
 
     files.sort_by_key(|name| name.to_string_lossy().to_lowercase());
     files
+}
+
+/// Return sorted images in the same directory as `file_path`.
+/// Wraps `scan_dir` — the viewer calls this when it already has a file handle.
+fn scan_image_directory(file_path: &Path) -> Vec<PathBuf> {
+    match file_path.parent() {
+        Some(dir) => {
+            let files = scan_dir(dir);
+            if files.is_empty() { vec![file_path.to_path_buf()] } else { files }
+        }
+        None => vec![file_path.to_path_buf()],
+    }
 }
 
 fn load_image(path: &Path) -> Result<LoadedImage, String> {
@@ -2316,6 +2327,38 @@ fn rgb_to_grayscale(rgb_image: Result<Array<f32, IxDyn>, Box<dyn Error>>) -> Res
     Ok(&rgb_array.slice(s![.., .., 0]) * 0.2989 + &rgb_array.slice(s![.., .., 1]) * 0.5870 + &rgb_array.slice(s![.., .., 2]) * 0.1140)
 }
 
+/// Resolve one or more shell arguments into a single file path to open.
+///
+/// Three cases are handled without subpath traversal:
+///
+/// * **Single file** (`image.NEF`)
+///   Open that file; the viewer scans its parent directory for siblings.
+///
+/// * **Directory** (`/path/to/folder` or `.`)
+///   Scan the directory for images; open the first one alphabetically.
+///
+/// * **Glob expansion** (`*.NEF` → many files passed by the shell)
+///   Take the first expanded file; the viewer scans its parent directory,
+///   so all image formats in that directory — not just the glob matches — are
+///   included in the browsing session.
+fn resolve_open_path(paths: Vec<String>) -> Result<PathBuf, Box<dyn Error>> {
+    let first = match paths.into_iter().next() {
+        Some(p) => get_absolute_path(&p)?,
+        None    => return pick_image_file().ok_or("No file selected.".into()),
+    };
+
+    if first.is_dir() {
+        // Directory argument: open the first valid image inside it.
+        scan_dir(&first)
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("No supported images found in '{}'", first.display()).into())
+    } else {
+        // Single file or first file from a glob — use it directly.
+        Ok(first)
+    }
+}
+
 fn get_absolute_path(filename: &str) -> Result<PathBuf, String> {
     let path = Path::new(filename);
     if path.is_absolute() {
@@ -2457,14 +2500,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     log::info!("LightningView {} starting", env!("CARGO_PKG_VERSION"));
 
-    let path = match args.paths.into_iter().next() {
-        // ── CLI mode: one or more paths supplied (e.g. from glob expansion) ───
-        // Use the first path; the viewer scans the directory for adjacent files.
-        Some(p) => get_absolute_path(&p)?,
-
-        // ── GUI mode: no argument → show native file picker ───────────────────
-        None => pick_image_file().ok_or("No file selected.")?,
-    };
+    let path = resolve_open_path(args.paths)?;
 
     run_viewer(path, !args.windowed)?;
     Ok(())
