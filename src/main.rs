@@ -401,6 +401,7 @@ impl ImageViewerApp {
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
         if !RAW_SUPPORTED_FORMATS.contains(&ext.as_str()) { return; }
         self.full_raw_requested.insert(order_pos);
+        self.prefetch_pending.insert(order_pos); // keeps egui repainting until result arrives
         let tx = self.priority_tx.clone();
         std::thread::spawn(move || {
             let t = Instant::now();
