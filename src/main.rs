@@ -155,6 +155,9 @@ struct ImageViewerApp {
     priority_rx:   mpsc::Receiver<(usize, ColorImage, u64)>,
     background_tx: mpsc::SyncSender<(usize, ColorImage, u64)>,
     background_rx: mpsc::Receiver<(usize, ColorImage, u64)>,
+    /// Failed loads send their order_pos here so poll_prefetch can clear prefetch_pending.
+    load_fail_tx:  mpsc::Sender<usize>,
+    load_fail_rx:  mpsc::Receiver<usize>,
     prefetch_pending: HashSet<usize>,
 
     // Culling mode
@@ -209,6 +212,7 @@ impl ImageViewerApp {
     fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>, initial_fullscreen: bool) -> Self {
         setup_icon_font(&cc.egui_ctx);
         let (priority_tx, priority_rx) = mpsc::channel();
+        let (load_fail_tx, load_fail_rx) = mpsc::channel();
         // Capacity 8: allows up to 8 decoded background images to queue before
         // rayon threads block. Each embedded JPEG ColorImage ≈ 10 MB → ≤ 80 MB
         // of channel backlog at any time, regardless of folder size.
@@ -221,6 +225,8 @@ impl ImageViewerApp {
             priority_rx,
             background_tx,
             background_rx,
+            load_fail_tx,
+            load_fail_rx,
             prefetch_pending: HashSet::new(),
             is_culling_mode: false,
             culling_min_stars: 1,
@@ -670,7 +676,8 @@ impl ImageViewerApp {
             let Some(path) = self.image_files.get(file_idx).cloned() else { continue };
             self.prefetch_pending.insert(pos);
             if priority {
-                let tx = self.priority_tx.clone();
+                let tx   = self.priority_tx.clone();
+                let fail = self.load_fail_tx.clone();
                 std::thread::spawn(move || {
                     let t = Instant::now();
                     match load_image(&path) {
@@ -679,11 +686,12 @@ impl ImageViewerApp {
                             log::debug!("thread[{}]: decoded {}×{} in {}ms", pos, img.width(), img.height(), ms);
                             let _ = tx.send((pos, img, ms));
                         }
-                        Err(e) => log::warn!("thread[{}]: load FAILED: {}", pos, e),
+                        Err(e) => { log::warn!("thread[{}]: load FAILED: {}", pos, e); let _ = fail.send(pos); }
                     }
                 });
             } else {
-                let tx = self.background_tx.clone();
+                let tx   = self.background_tx.clone();
+                let fail = self.load_fail_tx.clone();
                 rayon::spawn(move || {
                     let t = Instant::now();
                     match load_image(&path) {
@@ -692,7 +700,7 @@ impl ImageViewerApp {
                             log::debug!("bg_thread[{}]: decoded {}×{} in {}ms", pos, img.width(), img.height(), ms);
                             let _ = tx.send((pos, img, ms));
                         }
-                        Err(e) => log::warn!("bg_thread[{}]: load FAILED: {}", pos, e),
+                        Err(e) => { log::warn!("bg_thread[{}]: load FAILED: {}", pos, e); let _ = fail.send(pos); }
                     }
                 });
             }
@@ -758,6 +766,12 @@ impl ImageViewerApp {
         // Distance-based eviction every frame — keeps the cache window bounded
         // regardless of how many background results have arrived.
         self.evict_distant_images(self.current_index);
+
+        // Drain failed loads so their positions leave prefetch_pending and the
+        // repaint loop stops spinning on permanently-broken files.
+        while let Ok(pos) = self.load_fail_rx.try_recv() {
+            self.prefetch_pending.remove(&pos);
+        }
 
         // Keep the spinner animating while anything is still loading.
         if !self.prefetch_pending.is_empty() {
