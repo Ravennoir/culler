@@ -46,6 +46,9 @@ tempfile = "3"
 name = "perf"
 harness = false  # criterion provides its own harness
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(has_fontawesome)'] }
+
 [profile.release]
 strip = true
 opt-level = 3

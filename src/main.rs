@@ -48,7 +48,7 @@ fn setup_icon_font(ctx: &egui::Context) {
         let mut fonts = egui::FontDefinitions::default();
         fonts.font_data.insert(
             "fa-solid".to_owned(),
-            egui::FontData::from_static(FA),
+            egui::FontData::from_static(FA).into(),
         );
         fonts.families
             .entry(egui::FontFamily::Proportional)
@@ -1611,10 +1611,15 @@ fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                             egui::Stroke::new(1.0, Color32::from_gray(50)),
                         );
                     }
-                    // Focus indicator — small pill at the bottom of the focused column.
-                    // Sits above the info HUD strip when it is visible so it never overlaps.
+                    // Focus indicator — subtle border + small pill at the bottom.
+                    // Pill sits above the info HUD strip when it is visible so it never overlaps.
                     if slot == self.compare_focus {
-                        // Compute how much space the info strip occupies at the bottom.
+                        painter.rect_stroke(
+                            col_rect,
+                            0.0,
+                            egui::Stroke::new(1.0, Color32::from_white_alpha(60)),
+                            egui::StrokeKind::Inside,
+                        );
                         let info_h = if self.show_info_overlay {
                             let has_exif = self.exif_cache.get(&order_pos)
                                 .map(|rows| EXIF_ICONS.iter().any(|&(tag, pfx)|
