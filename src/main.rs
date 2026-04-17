@@ -407,7 +407,7 @@ impl ImageViewerApp {
             let t = Instant::now();
             match load_raw_full(&path) {
                 Ok(img) => {
-                    let color_image = to_egui_color_image(apply_exif_orientation(img, &path));
+                    let color_image = to_egui_color_image(img); // imagepipe already applied orientation
                     let _ = tx.send((order_pos, color_image, t.elapsed().as_millis() as u64));
                 }
                 Err(e) => log::error!("Full RAW decode failed: {e}"),
@@ -1329,13 +1329,12 @@ impl ImageViewerApp {
         if ctx.input(|i| i.key_pressed(egui::Key::F)) {
             self.is_fullscreen = !self.is_fullscreen;
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && !alt {
-            self.is_scaled_to_fit = !self.is_scaled_to_fit;
-        }
-        // Alt+Enter: decode selected image from raw sensor data at full resolution.
-        // Only meaningful for RAW files; no-op for other formats.
-        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) && alt {
+        // Alt+Enter (Option+Return on Mac): full sensor-resolution RAW decode.
+        // Checked first so Cmd+Enter (which has !alt) still hits scale-to-fit below.
+        if ctx.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.alt && !i.modifiers.command) {
             self.request_full_raw_decode(ctx);
+        } else if ctx.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.alt) {
+            self.is_scaled_to_fit = !self.is_scaled_to_fit;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
             self.show_delete_confirmation = true;
@@ -2560,14 +2559,13 @@ fn load_raw(path: &str) -> Result<DynamicImage, String> {
 }
 
 /// Full RAW decode via imagepipe — bypasses embedded JPEG previews entirely.
-/// Produces native-sensor-resolution output; may take several seconds.
+/// imagepipe applies EXIF orientation internally, so no extra rotation is needed.
+/// maxwidth/maxheight = 0 means native sensor resolution (slowest, highest quality).
 fn load_raw_full(path: &Path) -> Result<DynamicImage, String> {
     let path_str = path.to_str().unwrap_or("");
     log::debug!("Full RAW decode (sensor res) for {}", path_str);
-    let mut pipeline = imagepipe::Pipeline::new_from_file(path_str)
-        .map_err(|e| format!("Failed to load RAW: {e}"))?;
-    let decoded = pipeline.output_8bit(None)
-        .map_err(|e| format!("Failed to process RAW: {e}"))?;
+    let decoded = imagepipe::simple_decode_8bit(path_str, 0, 0)
+        .map_err(|e| format!("Failed to decode RAW: {e}"))?;
     image::RgbImage::from_raw(decoded.width as u32, decoded.height as u32, decoded.data)
         .map(DynamicImage::ImageRgb8)
         .ok_or_else(|| "Failed to create image from RAW data".to_string())
